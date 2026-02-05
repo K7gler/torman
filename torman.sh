@@ -399,7 +399,7 @@ toggle_control_port() {
     local current
     current=$(get_config_value "ControlPort" "disabled")
     
-    if [[ "$current" == "disabled" ]] || [[ -z "$current ]]; then
+    if [[ "$current" == "disabled" ]] || [[ -z "$current" ]]; then
         gum style --foreground 226 \
             "⚠ Enabling Control Port" \
             "" \

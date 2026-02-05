@@ -57,29 +57,26 @@ check_gum() {
 }
 
 install_gum() {
-    gum spin --spinner dot --title "Installing gum..." -- bash -c '
-        if command -v apt &> /dev/null; then
-            mkdir -p /etc/apt/keyrings
-            curl -fsSL https://repo.charm.sh/apt/gpg.key | gpg --dearmor -o /etc/apt/keyrings/charm.gpg
-            echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" | tee /etc/apt/sources.list.d/charm.list
-            apt update && apt install -y gum
-        elif command -v dnf &> /dev/null; then
-            echo "[charm]
-name=Charm
-baseurl=https://repo.charm.sh/yum/
-enabled=1
-gpgcheck=1
-gpgkey=https://repo.charm.sh/yum/gpg.key" | tee /etc/yum.repos.d/charm.repo
-            dnf install -y gum
-        else
-            echo "Unsupported package manager. Please install gum manually."
-            exit 1
-        fi
-    ' 2>&1 || {
-        gum style --foreground 196 "Failed to install gum."
+    echo -e "${YELLOW}Installing gum...${NC}"
+    
+    local install_success=0
+    
+    if command -v apt &> /dev/null; then
+        # Try installing from default repositories first
+        apt update && apt install -y gum && install_success=1
+    elif command -v dnf &> /dev/null; then
+        dnf install -y gum && install_success=1
+    else
+        echo -e "${RED}Unsupported package manager. Please install gum manually.${NC}"
         exit 1
-    }
-    gum style --foreground 82 "✓ gum installed successfully!"
+    fi
+
+    if [[ $install_success -eq 1 ]] && command -v gum &> /dev/null; then
+        echo -e "${GREEN}✓ gum installed successfully!${NC}"
+    else
+        echo -e "${RED}Failed to install gum. Please install it manually.${NC}"
+        exit 1
+    fi
 }
 
 check_dependencies() {

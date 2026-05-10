@@ -509,10 +509,12 @@ config_editor_menu() {
         local current_socks
         local current_control
         local current_exit
+        local current_strict
         
         current_socks=$(get_config_value "SocksPort" "$SOCKS_PORT")
         current_control=$(get_config_value "ControlPort" "disabled")
         current_exit=$(get_config_value "ExitNodes" "any")
+        current_strict=$(get_config_value "StrictNodes" "0")
         
         gum style --border rounded --padding "1 2" --border-foreground 212 \
             "Configuration Editor" \
@@ -520,12 +522,14 @@ config_editor_menu() {
             "Current Settings:" \
             "  SOCKS Port: $current_socks" \
             "  Control Port: $current_control" \
-            "  Exit Nodes: $current_exit"
+            "  Exit Nodes: $current_exit" \
+            "  StrictNodes: $current_strict"
         
         local choice
         choice=$(gum choose \
             "Edit SOCKS Port" \
             "Toggle Control Port" \
+            "Toggle StrictNodes" \
             "Set Exit Nodes" \
             "View Full Config" \
             "← Back to Main Menu")
@@ -536,6 +540,9 @@ config_editor_menu() {
                 ;;
             "Toggle Control Port")
                 toggle_control_port
+                ;;
+            "Toggle StrictNodes")
+                toggle_strict_nodes
                 ;;
             "Set Exit Nodes")
                 edit_exit_nodes
@@ -548,6 +555,32 @@ config_editor_menu() {
                 ;;
         esac
     done
+}
+
+toggle_strict_nodes() {
+    gum style --foreground 226 \
+        "⚠ StrictNodes Warning" \
+        "" \
+        "StrictNodes forces Tor to ONLY use your specified ExitNodes." \
+        "If none are available, Tor will fail to connect."
+    
+    local current
+    current=$(get_config_value "StrictNodes" "0")
+    
+    if [[ "$current" == "1" ]]; then
+        if gum confirm "StrictNodes is ENABLED. Disable it?"; then
+            set_config_value "StrictNodes" "0"
+            gum style --foreground 82 "✓ StrictNodes disabled."
+            sleep 1
+        fi
+    else
+        if gum confirm "Enable StrictNodes?"; then
+            set_config_value "StrictNodes" "1"
+            gum style --foreground 82 "✓ StrictNodes enabled."
+            gum style --foreground 226 "⚠ Restart Tor for changes to take effect."
+            sleep 2
+        fi
+    fi
 }
 
 edit_socks_port() {
@@ -614,6 +647,20 @@ edit_exit_nodes() {
     new_exit=$(gum input --placeholder "{us},{de},{gb}" --prompt "Exit Nodes > " --value "$current")
     
     if [[ -n "$new_exit" ]]; then
+        local invalid=0
+        local codes=$(echo "$new_exit" | grep -oE '\{[a-zA-Z]{2}\}' | tr -d '{}')
+        local code_count=$(echo "$codes" | grep -c '[a-zA-Z][a-zA-Z]' || true)
+        local expected_count=$(echo "$new_exit" | grep -c '{' || true)
+        
+        if [[ $code_count -ne $expected_count ]]; then
+            gum style --foreground 196 "✗ Invalid country code format!" \
+                "" \
+                "Each country code must be 2 letters inside braces: {us}, {de}, {gb}" \
+                "Example: {us},{de},{gb}"
+            sleep 3
+            return
+        fi
+        
         set_config_value "ExitNodes" "$new_exit"
         gum style --foreground 82 "✓ Exit Nodes set to $new_exit"
     else
@@ -1106,7 +1153,16 @@ view_logs() {
     gum style --border double --padding "1 2" --border-foreground 212 "Tor Service Logs (last 50 lines)"
     echo ""
     
-    journalctl -u tor -n 50 --no-pager | gum format
+    if command -v journalctl &> /dev/null && command -v systemctl &> /dev/null && systemctl is-system-running &> /dev/null; then
+        journalctl -u tor -n 50 --no-pager | gum format
+    elif [[ -f /var/log/tor/log ]]; then
+        tail -n 50 /var/log/tor/log | gum format
+    else
+        gum style --foreground 226 "⚠ Could not find Tor logs." \
+            "" \
+            "Neither journalctl nor /var/log/tor/log are available."
+        echo ""
+    fi
     
     echo ""
     gum style --foreground 246 "Press any key to continue..."

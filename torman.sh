@@ -195,11 +195,15 @@ set_config_value() {
     local key="$1"
     local value="$2"
     
+    backup_torrc
+    local original_perms
+    original_perms=$(get_file_permissions)
+    
     ensure_config_block
     
-    # Create a temporary file
     local tmp_file
     tmp_file=$(mktemp)
+    trap 'rm -f "$tmp_file"' EXIT
     
     # Process the file:
     # 1. Copy everything before our block
@@ -245,14 +249,50 @@ set_config_value() {
         !in_block { print }
     ' "$TORRC_PATH" > "$tmp_file"
     
-    # Replace original file
     mv "$tmp_file" "$TORRC_PATH"
-    chmod 644 "$TORRC_PATH"
+    restore_permissions "$original_perms"
+    trap - EXIT
 }
 
 remove_config_value() {
     local key="$1"
     set_config_value "$key" ""
+}
+
+################################################################################
+# Backup and Permissions Management
+################################################################################
+
+backup_torrc() {
+    if [[ ! -f "$TORRC_PATH" ]]; then
+        return
+    fi
+    
+    local backup_dir
+    backup_dir=$(dirname "$TORRC_PATH")
+    local timestamp
+    timestamp=$(date +%Y%m%d-%H%M%S)
+    local backup_file="$TORRC_PATH.backup.$timestamp"
+    
+    cp -p "$TORRC_PATH" "$backup_file"
+    
+    local backup_count
+    backup_count=$(ls -1 "$TORRC_PATH.backup."* 2>/dev/null | wc -l)
+    
+    if [[ $backup_count -gt 5 ]]; then
+        ls -1t "$TORRC_PATH.backup."* | tail -n+$((backup_count - 4)) | xargs -r rm
+    fi
+}
+
+get_file_permissions() {
+    stat -c %a "$TORRC_PATH" 2>/dev/null || stat -f %Lp "$TORRC_PATH" 2>/dev/null
+}
+
+restore_permissions() {
+    local original_perms="$1"
+    if [[ -n "$original_perms" ]]; then
+        chmod "$original_perms" "$TORRC_PATH"
+    fi
 }
 
 ################################################################################
@@ -603,9 +643,13 @@ create_onion_service() {
     "
     
     # Add to torrc - we need to add it to our managed block
-    # This requires careful insertion
+    backup_torrc
+    local original_perms
+    original_perms=$(get_file_permissions)
+    
     local tmp_file
     tmp_file=$(mktemp)
+    trap 'rm -f "$tmp_file"' EXIT
     
     awk -v end="$CONFIG_END_MARKER" \
         -v service_dir="$service_dir" \
@@ -621,7 +665,8 @@ create_onion_service() {
     ' "$TORRC_PATH" > "$tmp_file"
     
     mv "$tmp_file" "$TORRC_PATH"
-    chmod 644 "$TORRC_PATH"
+    restore_permissions "$original_perms"
+    trap - EXIT
     
     gum style --foreground 82 "✓ Service configuration added."
     
@@ -716,8 +761,13 @@ delete_onion_service() {
     
     if gum confirm --affirmative="DELETE" --negative="Cancel" "Permanently delete '$choice'?"; then
         # Remove from torrc
+        backup_torrc
+        local original_perms
+        original_perms=$(get_file_permissions)
+        
         local tmp_file
         tmp_file=$(mktemp)
+        trap 'rm -f "$tmp_file"' EXIT
         
         awk -v service_dir="$service_dir" '
             # Skip HiddenServiceDir line and the following HiddenServicePort line(s)
@@ -735,7 +785,8 @@ delete_onion_service() {
         ' "$TORRC_PATH" > "$tmp_file"
         
         mv "$tmp_file" "$TORRC_PATH"
-        chmod 644 "$TORRC_PATH"
+        restore_permissions "$original_perms"
+        trap - EXIT
         
         # Remove directory
         rm -rf "$service_dir"

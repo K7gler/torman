@@ -1680,6 +1680,125 @@ check_tor_connectivity() {
 }
 
 ################################################################################
+# Bandwidth Monitor
+################################################################################
+
+human_readable_bytes() {
+    local bytes=$1
+    if [[ $bytes -lt 1024 ]]; then
+        echo "${bytes}B"
+    elif [[ $bytes -lt 1048576 ]]; then
+        printf "%.2fKB" "$(echo "scale=2; $bytes / 1024" | bc)"
+    elif [[ $bytes -lt 1073741824 ]]; then
+        printf "%.2fMB" "$(echo "scale=2; $bytes / 1048576" | bc)"
+    else
+        printf "%.2fGB" "$(echo "scale=2; $bytes / 1073741824" | bc)"
+    fi
+}
+
+bandwidth_monitor_menu() {
+    local control_port
+    control_port=$(get_config_value "ControlPort" "")
+    
+    if [[ -z "$control_port" ]] || [[ "$control_port" == "disabled" ]]; then
+        gum style --foreground 196 \
+            "✗ Control Port is disabled!" \
+            "" \
+            "Enable it in Configuration Editor first."
+        sleep 2
+        return
+    fi
+    
+    if ! pgrep -x tor > /dev/null 2>&1; then
+        gum style --foreground 196 \
+            "✗ Tor is not running!" \
+            "" \
+            "Start Tor first."
+        sleep 2
+        return
+    fi
+    
+    local prev_read=0
+    local prev_written=0
+    local first_run=1
+    
+    while true; do
+        clear
+        gum style --border double --padding "1 2" --border-foreground 82 \
+            "📊 Tor Bandwidth Monitor" \
+            "" \
+            "Live bandwidth statistics (updates every 2s)" \
+            "Press Enter to exit"
+        echo ""
+        
+        local tmp_result=$(mktemp)
+        local tmp_exit=$(mktemp)
+        trap 'rm -f "$tmp_result" "$tmp_exit"' RETURN EXIT
+        
+        {
+            echo -e 'AUTHENTICATE ""\nGETINFO traffic/read\nGETINFO traffic/written\nQUIT'
+        } | nc 127.0.0.1 "$control_port" > "$tmp_result" 2>&1
+        echo $? > "$tmp_exit"
+        
+        if [[ $(cat "$tmp_exit") -ne 0 ]]; then
+            local cookie_file="/var/lib/tor/control_auth_cookie"
+            if [[ -f "$cookie_file" ]]; then
+                local cookie_hex
+                cookie_hex=$(xxd -p "$cookie_file" | tr -d '\n')
+                if [[ -n "$cookie_hex" ]]; then
+                    {
+                        echo -e "AUTHENTICATE $cookie_hex\nGETINFO traffic/read\nGETINFO traffic/written\nQUIT"
+                    } | nc 127.0.0.1 "$control_port" > "$tmp_result" 2>&1
+                    echo $? > "$tmp_exit"
+                fi
+            fi
+        fi
+        
+        local traffic_read=$(grep "^250-traffic/read=" "$tmp_result" | cut -d= -f2)
+        local traffic_written=$(grep "^250-traffic/written=" "$tmp_result" | cut -d= -f2)
+        
+        if [[ -z "$traffic_read" ]] || [[ -z "$traffic_written" ]]; then
+            gum style --foreground 196 "✗ Failed to get bandwidth stats. Check control port."
+            echo ""
+            gum style --foreground 246 "Press Enter to exit..."
+            read -n 1 -s
+            return
+        fi
+        
+        local read_rate=0
+        local write_rate=0
+        
+        if [[ $first_run -eq 0 ]]; then
+            local read_diff=$((traffic_read - prev_read))
+            local write_diff=$((traffic_written - prev_written))
+            read_rate=$((read_diff / 2))
+            write_rate=$((write_diff / 2))
+        fi
+        first_run=0
+        prev_read=$traffic_read
+        prev_written=$traffic_written
+        
+        gum style --border rounded --padding "1 2" --border-foreground 212 \
+            "Total Data Transfer" \
+            "" \
+            "  $(gum style --foreground 82 "↓ Read:")  $(gum style --bold "$(human_readable_bytes $traffic_read)")" \
+            "  $(gum style --foreground 196 "↑ Written:") $(gum style --bold "$(human_readable_bytes $traffic_written)")" \
+            "" \
+            "Current Rates (bytes/sec)" \
+            "" \
+            "  $(gum style --foreground 82 "↓ Read Rate:")  $(gum style --bold "$(human_readable_bytes $read_rate)/s")" \
+            "  $(gum style --foreground 196 "↑ Write Rate:") $(gum style --bold "$(human_readable_bytes $write_rate)/s")"
+        
+        echo ""
+        gum style --foreground 246 "Press Enter to exit..."
+        
+        if read -t 2 -n 1; then
+            return
+        fi
+    done
+}
+
+################################################################################
 # Logs Viewer
 ################################################################################
 
@@ -1749,11 +1868,12 @@ main_menu() {
         
         local choice
         choice=$(gum choose \
-            --height 12 \
+            --height 13 \
             --cursor "→ " \
             "⚙️  Service Control" \
             "📝 Configuration Editor" \
             "🔄 Identity Tools" \
+            "📊 Bandwidth Monitor" \
             "🧅 Onion Services" \
             "📋 View Logs" \
             "❌ Exit")
@@ -1767,6 +1887,9 @@ main_menu() {
                 ;;
             "🔄 Identity Tools")
                 identity_tools_menu
+                ;;
+            "📊 Bandwidth Monitor")
+                bandwidth_monitor_menu
                 ;;
             "🧅 Onion Services")
                 onion_service_menu

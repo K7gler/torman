@@ -528,11 +528,15 @@ config_editor_menu() {
         local current_socks
         local current_control
         local current_exit
+        local current_exclude
+        local current_exclude_exit
         local current_strict
         
         current_socks=$(get_config_value "SocksPort" "$SOCKS_PORT")
         current_control=$(get_config_value "ControlPort" "disabled")
         current_exit=$(get_config_value "ExitNodes" "any")
+        current_exclude=$(get_config_value "ExcludeNodes" "none")
+        current_exclude_exit=$(get_config_value "ExcludeExitNodes" "none")
         current_strict=$(get_config_value "StrictNodes" "0")
         
         gum style --border rounded --padding "1 2" --border-foreground 212 \
@@ -542,6 +546,8 @@ config_editor_menu() {
             "  SOCKS Port: $current_socks" \
             "  Control Port: $current_control" \
             "  Exit Nodes: $current_exit" \
+            "  Exclude Nodes: $current_exclude" \
+            "  Exclude Exit Nodes: $current_exclude_exit" \
             "  StrictNodes: $current_strict"
         
         local choice
@@ -550,6 +556,8 @@ config_editor_menu() {
             "Toggle Control Port" \
             "Toggle StrictNodes" \
             "Set Exit Nodes" \
+            "Set Exclude Nodes" \
+            "Set Exclude Exit Nodes" \
             "View Full Config" \
             "← Back to Main Menu")
         
@@ -565,6 +573,12 @@ config_editor_menu() {
                 ;;
             "Set Exit Nodes")
                 edit_exit_nodes
+                ;;
+            "Set Exclude Nodes")
+                edit_exclude_nodes
+                ;;
+            "Set Exclude Exit Nodes")
+                edit_exclude_exit_nodes
                 ;;
             "View Full Config")
                 view_config
@@ -682,6 +696,82 @@ edit_exit_nodes() {
     else
         remove_config_value "ExitNodes"
         gum style --foreground 82 "✓ Exit Nodes cleared (using any)."
+        offer_restart
+    fi
+}
+
+edit_exclude_nodes() {
+    gum style --foreground 212 \
+        "Exclude Nodes Configuration" \
+        "" \
+        "Exclude country codes (e.g., {ru},{cn})" \
+        "These countries will NEVER be used in circuits." \
+        "Leave empty for no exclusions."
+    
+    local current
+    current=$(get_config_value "ExcludeNodes" "")
+    
+    local new_exclude
+    new_exclude=$(gum input --placeholder "{ru},{cn}" --prompt "Exclude Nodes > " --value "$current")
+    
+    if [[ -n "$new_exclude" ]]; then
+        local codes=$(echo "$new_exclude" | grep -oE '\{[a-zA-Z]{2}\}' | tr -d '{}')
+        local code_count=$(echo "$codes" | grep -c '[a-zA-Z][a-zA-Z]' || true)
+        local expected_count=$(echo "$new_exclude" | grep -c '{' || true)
+        
+        if [[ $code_count -ne $expected_count ]]; then
+            gum style --foreground 196 "✗ Invalid country code format!" \
+                "" \
+                "Each country code must be 2 letters inside braces: {ru}, {cn}, {kp}" \
+                "Example: {ru},{cn}"
+            sleep 3
+            return
+        fi
+        
+        set_config_value "ExcludeNodes" "$new_exclude"
+        gum style --foreground 82 "✓ Exclude Nodes set to $new_exclude"
+        offer_restart
+    else
+        remove_config_value "ExcludeNodes"
+        gum style --foreground 82 "✓ Exclude Nodes cleared."
+        offer_restart
+    fi
+}
+
+edit_exclude_exit_nodes() {
+    gum style --foreground 212 \
+        "Exclude Exit Nodes Configuration" \
+        "" \
+        "Exclude exit node countries (e.g., {ru},{cn})" \
+        "These countries will NEVER be used as exits." \
+        "Leave empty for no exclusions."
+    
+    local current
+    current=$(get_config_value "ExcludeExitNodes" "")
+    
+    local new_exclude
+    new_exclude=$(gum input --placeholder "{ru},{cn}" --prompt "Exclude Exit Nodes > " --value "$current")
+    
+    if [[ -n "$new_exclude" ]]; then
+        local codes=$(echo "$new_exclude" | grep -oE '\{[a-zA-Z]{2}\}' | tr -d '{}')
+        local code_count=$(echo "$codes" | grep -c '[a-zA-Z][a-zA-Z]' || true)
+        local expected_count=$(echo "$new_exclude" | grep -c '{' || true)
+        
+        if [[ $code_count -ne $expected_count ]]; then
+            gum style --foreground 196 "✗ Invalid country code format!" \
+                "" \
+                "Each country code must be 2 letters inside braces: {ru}, {cn}, {kp}" \
+                "Example: {ru},{cn}"
+            sleep 3
+            return
+        fi
+        
+        set_config_value "ExcludeExitNodes" "$new_exclude"
+        gum style --foreground 82 "✓ Exclude Exit Nodes set to $new_exclude"
+        offer_restart
+    else
+        remove_config_value "ExcludeExitNodes"
+        gum style --foreground 82 "✓ Exclude Exit Nodes cleared."
         offer_restart
     fi
 }

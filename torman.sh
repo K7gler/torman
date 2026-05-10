@@ -20,6 +20,7 @@ readonly CONTROL_PORT=9051
 readonly SOCKS_PORT=9050
 readonly CONFIG_BEGIN_MARKER="# BEGIN TORMAN_CONFIG"
 readonly CONFIG_END_MARKER="# END TORMAN_CONFIG"
+readonly BACKUP_DIR="/var/backups/torman"
 
 # Colors for fallback mode
 readonly RED='\033[0;31m'
@@ -105,7 +106,7 @@ install_gum() {
 check_dependencies() {
     local missing_deps=()
     
-    for cmd in tor curl nc; do
+    for cmd in tor curl nc gzip; do
         if ! command -v "$cmd" &> /dev/null; then
             missing_deps+=("$cmd")
         fi
@@ -136,6 +137,7 @@ install_dependencies() {
         [nc]="netcat-openbsd"
         [tor]="tor"
         [curl]="curl"
+        [gzip]="gzip"
     )
     
     local packages=()
@@ -801,6 +803,10 @@ onion_service_menu() {
             "Create New Service" \
             "Add Port to Existing Service" \
             "Delete Service" \
+            "---" \
+            "Backup Single Service" \
+            "Backup All Services" \
+            "Restore Service from Backup" \
             "← Back to Main Menu")
         
         case "$choice" in
@@ -815,6 +821,15 @@ onion_service_menu() {
                 ;;
             "Delete Service")
                 delete_onion_service
+                ;;
+            "Backup Single Service")
+                backup_single_service
+                ;;
+            "Backup All Services")
+                backup_all_services
+                ;;
+            "Restore Service from Backup")
+                restore_service
                 ;;
             "← Back to Main Menu")
                 return
@@ -1265,6 +1280,246 @@ add_onion_service_port() {
         gum style --foreground 82 "✓ Tor reloaded."
         sleep 1
     fi
+}
+
+################################################################################
+# Onion Service Backup and Restore
+################################################################################
+
+backup_single_service() {
+    local services=()
+    
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^HiddenServiceDir[[:space:]]+(.+)$ ]]; then
+            local service_dir="${BASH_REMATCH[1]}"
+            local service_name
+            service_name=$(basename "$service_dir")
+            services+=("$service_name|$service_dir")
+        fi
+    done < <(sed -n "/$CONFIG_BEGIN_MARKER/,/$CONFIG_END_MARKER/p" "$TORRC_PATH")
+    
+    if [[ ${#services[@]} -eq 0 ]]; then
+        gum style --foreground 226 "No onion services to backup."
+        sleep 1
+        return
+    fi
+    
+    local service_choices=()
+    for svc in "${services[@]}"; do
+        local name="${svc%%|*}"
+        service_choices+=("$name")
+    done
+    service_choices+=("← Cancel")
+    
+    local choice
+    choice=$(gum choose "Select service to backup:" "${service_choices[@]}")
+    
+    if [[ "$choice" == "← Cancel" ]]; then
+        return
+    fi
+    
+    local service_dir=""
+    for svc in "${services[@]}"; do
+        local name="${svc%%|*}"
+        if [[ "$name" == "$choice" ]]; then
+            service_dir="${svc##*|}"
+            break
+        fi
+    done
+    
+    mkdir -p "$BACKUP_DIR" 2>/dev/null || {
+        gum style --foreground 196 "Failed to create backup directory: $BACKUP_DIR"
+        sleep 2
+        return
+    }
+    
+    local timestamp
+    timestamp=$(date +%Y%m%d-%H%M%S)
+    local backup_file="$BACKUP_DIR/${choice}-${timestamp}.tar.gz"
+    
+    if tar -czf "$backup_file" -C "$(dirname "$service_dir")" "$(basename "$service_dir")" 2>/dev/null; then
+        chmod 600 "$backup_file"
+        gum style --foreground 82 "✓ Backed up '$choice' to $backup_file"
+    else
+        gum style --foreground 196 "Failed to create backup for '$choice'"
+        sleep 2
+        return
+    fi
+    
+    sleep 1
+}
+
+backup_all_services() {
+    local services=()
+    local service_dirs=()
+    
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^HiddenServiceDir[[:space:]]+(.+)$ ]]; then
+            local service_dir="${BASH_REMATCH[1]}"
+            local service_name
+            service_name=$(basename "$service_dir")
+            services+=("$service_name")
+            service_dirs+=("$service_dir")
+        fi
+    done < <(sed -n "/$CONFIG_BEGIN_MARKER/,/$CONFIG_END_MARKER/p" "$TORRC_PATH")
+    
+    if [[ ${#services[@]} -eq 0 ]]; then
+        gum style --foreground 226 "No onion services to backup."
+        sleep 1
+        return
+    fi
+    
+    mkdir -p "$BACKUP_DIR" 2>/dev/null || {
+        gum style --foreground 196 "Failed to create backup directory: $BACKUP_DIR"
+        sleep 2
+        return
+    }
+    
+    local timestamp
+    timestamp=$(date +%Y%m%d-%H%M%S)
+    local backup_file="$BACKUP_DIR/onion-services-${timestamp}.tar.gz"
+    
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    trap 'rm -rf "$tmp_dir"' RETURN EXIT
+    
+    for svc_dir in "${service_dirs[@]}"; do
+        ln -s "$svc_dir" "$tmp_dir/$(basename "$svc_dir")" 2>/dev/null || true
+    done
+    
+    local tar_sources=""
+    for svc in "${services[@]}"; do
+        tar_sources="$tar_sources $(basename "$svc")"
+    done
+    
+    if tar -czf "$backup_file" -C "$tmp_dir" $tar_sources 2>/dev/null; then
+        chmod 600 "$backup_file"
+        gum style --foreground 82 "✓ Backed up ${#services[@]} services to $backup_file"
+    else
+        rm -f "$backup_file"
+        gum style --foreground 196 "Failed to create backup archive"
+        sleep 2
+        return
+    fi
+    
+    sleep 1
+}
+
+restore_service() {
+    if [[ ! -d "$BACKUP_DIR" ]] || [[ -z "$(ls -A "$BACKUP_DIR"/*.tar.gz 2>/dev/null)" ]]; then
+        gum style --foreground 226 "No backups found in $BACKUP_DIR"
+        sleep 1
+        return
+    fi
+    
+    local backups=()
+    while IFS= read -r f; do
+        backups+=("$(basename "$f")")
+    done < <(ls -t "$BACKUP_DIR"/*.tar.gz 2>/dev/null)
+    
+    if [[ ${#backups[@]} -eq 0 ]]; then
+        gum style --foreground 226 "No backups found"
+        sleep 1
+        return
+    fi
+    
+    local choice
+    choice=$(gum choose "Select backup to restore:" "${backups[@]}" "← Cancel")
+    
+    if [[ "$choice" == "← Cancel" ]] || [[ -z "$choice" ]]; then
+        return
+    fi
+    
+    local backup_file="$BACKUP_DIR/$choice"
+    local preview_lines
+    preview_lines=$(tar -tzf "$backup_file" 2>/dev/null | head -20)
+    
+    clear
+    gum style --border double --padding "1 2" --border-foreground 212 "Backup Contents: $choice"
+    echo ""
+    gum style --foreground 212 "Files in backup:"
+    echo "$preview_lines" | gum format
+    echo ""
+    gum style --foreground 226 "⚠ WARNING: This will overwrite existing service directories!"
+    
+    if ! gum confirm "Restore from this backup?"; then
+        return
+    fi
+    
+    local services_in_backup=()
+    while IFS= read -r line; do
+        local svc_name=$(basename "$line" | tr -d '/')
+        if [[ -n "$svc_name" ]] && [[ ! " ${services_in_backup[*]} " =~ " ${svc_name} " ]]; then
+            services_in_backup+=("$svc_name")
+        fi
+    done < <(tar -tzf "$backup_file" 2>/dev/null | grep '/$' | head -20)
+    
+    for svc_name in "${services_in_backup[@]}"; do
+        local target_dir="$TOR_DATA_DIR/$svc_name"
+        
+        if [[ -d "$target_dir" ]]; then
+            gum style --foreground 226 "⚠ Service '$svc_name' already exists at $target_dir"
+            if ! gum confirm "Overwrite existing '$svc_name'?"; then
+                continue
+            fi
+        fi
+        
+        local extract_dir
+        extract_dir=$(mktemp -d)
+        trap 'rm -rf "$extract_dir"' RETURN EXIT
+        
+        if ! tar -xzf "$backup_file" -C "$extract_dir" 2>/dev/null; then
+            gum style --foreground 196 "Failed to extract '$svc_name' from backup"
+            sleep 2
+            continue
+        fi
+        
+        local extracted_path="$extract_dir/$svc_name"
+        if [[ -d "$extracted_path" ]]; then
+            mkdir -p "$target_dir"
+            cp -r "$extracted_path"/* "$target_dir/" 2>/dev/null || true
+            chown -R "$TOR_USER:$TOR_USER" "$target_dir"
+            chmod 700 "$target_dir"
+            
+            if [[ ! -d "$target_dir" ]] || [[ -z "$(ls -A "$target_dir" 2>/dev/null)" ]]; then
+                gum style --foreground 196 "Warning: $target_dir appears empty after restore"
+            fi
+        fi
+        
+        local torrc_has_entry=$(sed -n "/$CONFIG_BEGIN_MARKER/,/$CONFIG_END_MARKER/p" "$TORRC_PATH" | grep -c "^HiddenServiceDir $target_dir" || true)
+        if [[ "$torrc_has_entry" -eq 0 ]]; then
+            backup_torrc
+            local original_perms
+            original_perms=$(get_file_permissions)
+            
+            local tmp_file
+            tmp_file=$(mktemp)
+            trap 'rm -f "$tmp_file"' RETURN EXIT
+            
+            awk -v end="$CONFIG_END_MARKER" \
+                -v service_dir="$target_dir" '
+            $0 ~ end {
+                print "HiddenServiceDir " service_dir
+                print $0
+                next
+            }
+            { print }
+            ' "$TORRC_PATH" > "$tmp_file"
+            
+            mv "$tmp_file" "$TORRC_PATH"
+            restore_permissions "$original_perms"
+            trap - RETURN EXIT
+        fi
+        
+        gum style --foreground 82 "✓ Restored service: $svc_name"
+    done
+    
+    if validate_tor_config; then
+        gum style --foreground 82 "✓ Configuration validated"
+        offer_restart
+    fi
+    
+    sleep 1
 }
 
 ################################################################################

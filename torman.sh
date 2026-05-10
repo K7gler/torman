@@ -252,6 +252,10 @@ set_config_value() {
     mv "$tmp_file" "$TORRC_PATH"
     restore_permissions "$original_perms"
     trap - EXIT
+    
+    if ! validate_tor_config; then
+        return
+    fi
 }
 
 remove_config_value() {
@@ -293,6 +297,115 @@ restore_permissions() {
     if [[ -n "$original_perms" ]]; then
         chmod "$original_perms" "$TORRC_PATH"
     fi
+}
+
+################################################################################
+# Tor Config Validation
+################################################################################
+
+validate_tor_config() {
+    local verify_output
+    local verify_exit
+    
+    gum spin --spinner dot --title "Validating Tor configuration..." -- \
+        verify_output=$(tor -f "$TORRC_PATH" --verify-config 2>&1)
+    verify_exit=$?
+    
+    if [[ $verify_exit -ne 0 ]]; then
+        clear
+        gum style --border rounded --padding "1 2" --border-foreground 196 \
+            "✗ Tor Configuration Validation Failed" \
+            "" \
+            "Error output:" \
+            "" \
+            "$(echo "$verify_output" | head -20 | gum format)"
+        
+        local latest_backup
+        latest_backup=$(ls -t "$TORRC_PATH.backup."* 2>/dev/null | head -n1)
+        
+        if [[ -n "$latest_backup" ]] && gum confirm "Restore from latest backup?"; then
+            cp -p "$latest_backup" "$TORRC_PATH"
+            gum style --foreground 82 "✓ Restored from $latest_backup"
+            sleep 2
+            return 1
+        fi
+        
+        gum style --foreground 196 "Configuration NOT applied. Please fix errors manually."
+        sleep 3
+        return 1
+    fi
+    
+    return 0
+}
+
+restore_from_backup() {
+    local latest_backup
+    latest_backup=$(ls -t "$TORRC_PATH.backup."* 2>/dev/null | head -n1)
+    
+    if [[ -n "$latest_backup" ]]; then
+        cp -p "$latest_backup" "$TORRC_PATH"
+        gum style --foreground 82 "✓ Restored from $latest_backup"
+    else
+        gum style --foreground 196 "No backup found."
+    fi
+}
+
+is_port_available() {
+    local port="$1"
+    
+    if command -v ss &> /dev/null; then
+        if ss -tlnp 2>/dev/null | grep -q ":$port "; then
+            return 1
+        fi
+    elif command -v netstat &> /dev/null; then
+        if netstat -tlnp 2>/dev/null | grep -q ":$port "; then
+            return 1
+        fi
+    fi
+    
+    return 0
+}
+
+is_port_listening() {
+    local port="$1"
+    
+    if command -v ss &> /dev/null; then
+        if ss -tlnp 2>/dev/null | grep -q ":$port "; then
+            return 0
+        fi
+    elif command -v netstat &> /dev/null; then
+        if netstat -tlnp 2>/dev/null | grep -q ":$port "; then
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
+validate_port() {
+    local port="$1"
+    local port_name="${2:-Port}"
+    
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [[ $port -lt 1 ]] || [[ $port -gt 65535 ]]; then
+        gum style --foreground 196 "✗ $port_name must be between 1 and 65535."
+        return 1
+    fi
+    
+    if [[ $port -lt 1024 ]]; then
+        gum style --foreground 226 "⚠ Warning: $port_name $port is a privileged port (< 1024). Root binding required."
+        if ! gum confirm "Continue anyway?"; then
+            return 1
+        fi
+    fi
+    
+    if is_port_available "$port"; then
+        gum style --foreground 226 "⚠ Warning: Port $port may already be in use."
+        if ! gum confirm "Continue anyway?"; then
+            return 1
+        fi
+    fi
+    
+    return 0
 }
 
 ################################################################################
@@ -444,14 +557,16 @@ edit_socks_port() {
     local new_port
     new_port=$(gum input --placeholder "$current" --prompt "SOCKS Port > " --value "$current")
     
-    if [[ -n "$new_port" ]] && [[ "$new_port" =~ ^[0-9]+$ ]]; then
+    if [[ -n "$new_port" ]]; then
+        if ! validate_port "$new_port" "SOCKS Port"; then
+            sleep 1
+            return
+        fi
+        
         set_config_value "SocksPort" "$new_port"
         gum style --foreground 82 "✓ SOCKS Port set to $new_port"
         gum style --foreground 226 "⚠ Restart Tor for changes to take effect."
         sleep 2
-    else
-        gum style --foreground 196 "Invalid port number."
-        sleep 1
     fi
 }
 
@@ -616,12 +731,29 @@ create_onion_service() {
         return
     fi
     
+    if ! validate_port "$local_port" "Local Port"; then
+        sleep 1
+        return
+    fi
+    
+    if ! is_port_listening "$local_port"; then
+        gum style --foreground 226 "⚠ Warning: Nothing appears to be listening on port $local_port."
+        if ! gum confirm "Continue anyway?"; then
+            return
+        fi
+    fi
+    
     # Get Tor port
     local tor_port
     tor_port=$(gum input --placeholder "80" --prompt "Tor Port (external) > ")
     
     if [[ ! "$tor_port" =~ ^[0-9]+$ ]]; then
         gum style --foreground 196 "Invalid port number."
+        sleep 1
+        return
+    fi
+    
+    if ! validate_port "$tor_port" "Tor Port"; then
         sleep 1
         return
     fi
@@ -667,6 +799,10 @@ create_onion_service() {
     mv "$tmp_file" "$TORRC_PATH"
     restore_permissions "$original_perms"
     trap - EXIT
+    
+    if ! validate_tor_config; then
+        return
+    fi
     
     gum style --foreground 82 "✓ Service configuration added."
     
@@ -770,22 +906,29 @@ delete_onion_service() {
         trap 'rm -f "$tmp_file"' EXIT
         
         awk -v service_dir="$service_dir" '
-            # Skip HiddenServiceDir line and the following HiddenServicePort line(s)
-            $0 ~ "^HiddenServiceDir " service_dir {
-                skip_next = 1
-                next
-            }
-            skip_next && /^HiddenServicePort/ {
-                next
-            }
-            {
-                skip_next = 0
-                print
-            }
+        /^HiddenServiceDir / && $2 == service_dir {
+            skip_block = 1
+            next
+        }
+        skip_block && /^HiddenServicePort / {
+            next
+        }
+        skip_block && !/^HiddenServicePort / {
+            skip_block = 0
+        }
+        /^HiddenServiceDir / {
+            skip_block = 0
+        }
+        { print }
         ' "$TORRC_PATH" > "$tmp_file"
         
         mv "$tmp_file" "$TORRC_PATH"
         restore_permissions "$original_perms"
+        
+        if ! validate_tor_config; then
+            trap - EXIT
+            return
+        fi
         trap - EXIT
         
         # Remove directory

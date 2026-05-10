@@ -309,8 +309,8 @@ get_tor_status() {
 
 get_tor_external_ip() {
     local ip
-    ip=$(timeout 5 curl -s --socks5 127.0.0.1:"$SOCKS_PORT" https://check.torproject.org/api/ip 2>/dev/null | grep -oP '"IsTor":\s*true.*?"IP":\s*"\K[^"]+' || echo "N/A")
-    echo "$ip"
+    ip=$(timeout 5 curl -s --socks5 127.0.0.1:"$SOCKS_PORT" https://check.torproject.org/api/ip 2>/dev/null | awk -F'"IP": *"' '{if($2)print substr($2,2,index($2,"\"}")-1)}')
+    echo "${ip:-N/A}"
 }
 
 service_control_menu() {
@@ -830,6 +830,35 @@ identity_tools_menu() {
     done
 }
 
+authenticate_control_port() {
+    local control_port="$1"
+    local result_file=$(mktemp)
+    local exit_file=$(mktemp)
+    trap 'rm -f "$result_file" "$exit_file"' RETURN EXIT
+    
+    echo -e 'AUTHENTICATE ""\nQUIT' | nc 127.0.0.1 "$control_port" > "$result_file" 2>&1
+    echo $? > "$exit_file"
+    
+    if [[ $(cat "$exit_file") -eq 0 ]] && grep -q "^250 OK" "$result_file"; then
+        return 0
+    fi
+    
+    local cookie_file="/var/lib/tor/control_auth_cookie"
+    if [[ -f "$cookie_file" ]]; then
+        local cookie_hex
+        cookie_hex=$(xxd -p "$cookie_file" | tr -d '\n')
+        if [[ -n "$cookie_hex" ]]; then
+            echo -e "AUTHENTICATE $cookie_hex\nQUIT" | nc 127.0.0.1 "$control_port" > "$result_file" 2>&1
+            echo $? > "$exit_file"
+            if [[ $(cat "$exit_file") -eq 0 ]] && grep -q "^250 OK" "$result_file"; then
+                return 0
+            fi
+        fi
+    fi
+    
+    return 1
+}
+
 new_identity() {
     local control_port
     control_port=$(get_config_value "ControlPort" "")
@@ -843,11 +872,18 @@ new_identity() {
         return
     fi
     
+    local tmp_result=$(mktemp)
+    local tmp_exit=$(mktemp)
+    trap 'rm -f "$tmp_result" "$tmp_exit"' RETURN EXIT
+    
     gum spin --spinner dot --title "Requesting new identity..." -- bash -c "
-        echo -e 'AUTHENTICATE \"\"\nSIGNAL NEWNYM\nQUIT' | nc 127.0.0.1 $control_port > /dev/null 2>&1
+        echo -e 'AUTHENTICATE \"\"\nSIGNAL NEWNYM\nQUIT' | nc 127.0.0.1 $control_port > '$tmp_result' 2>&1
+        echo \$? > '$tmp_exit'
     "
     
-    if [[ $? -eq 0 ]]; then
+    local nc_exit=$(cat "$tmp_exit")
+    
+    if [[ $nc_exit -eq 0 ]]; then
         gum style --foreground 82 "✓ New identity requested successfully!"
         gum style --foreground 226 "Note: Tor will use a new circuit. Wait a few seconds."
     else
@@ -869,9 +905,12 @@ check_ip() {
     
     if [[ -n "$ip" ]]; then
         local is_tor
-        is_tor=$(echo "$ip" | grep -o '"IsTor":\s*true' || echo "false")
+        is_tor=$(echo "$ip" | awk '/"IsTor":\s*true/{print "true"}')
         local ip_addr
-        ip_addr=$(echo "$ip" | grep -oP '"IP":\s*"\K[^"]+' || echo "Unknown")
+        ip_addr=$(echo "$ip" | awk -F'"IP": *"' '{if($2)print substr($2,2,index($2,"\"}")-1)}')
+        if [[ -z "$ip_addr" ]]; then
+            ip_addr="Unknown"
+        fi
         
         clear
         if [[ "$is_tor" != "false" ]]; then

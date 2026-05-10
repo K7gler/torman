@@ -799,6 +799,7 @@ onion_service_menu() {
         choice=$(gum choose \
             "List Onion Services" \
             "Create New Service" \
+            "Add Port to Existing Service" \
             "Delete Service" \
             "← Back to Main Menu")
         
@@ -808,6 +809,9 @@ onion_service_menu() {
                 ;;
             "Create New Service")
                 create_onion_service
+                ;;
+            "Add Port to Existing Service")
+                add_onion_service_port
                 ;;
             "Delete Service")
                 delete_onion_service
@@ -826,25 +830,52 @@ list_onion_services() {
     
     local found=0
     
-    # Parse torrc for HiddenServiceDir entries in our block
+    local current_service=""
+    local current_dir=""
+    declare -A service_dirs
+    declare -A port_mappings
+    
     while IFS= read -r line; do
         if [[ "$line" =~ ^HiddenServiceDir[[:space:]]+(.+)$ ]]; then
-            local service_dir="${BASH_REMATCH[1]}"
-            local service_name
-            service_name=$(basename "$service_dir")
-            local hostname_file="$service_dir/hostname"
-            
-            if [[ -f "$hostname_file" ]]; then
-                local hostname
-                hostname=$(cat "$hostname_file")
-                gum style --foreground 212 "● $service_name"
-                gum style --foreground 246 "  Directory: $service_dir"
-                gum style --foreground 82 "  Hostname: $hostname"
-                echo ""
-                found=1
+            if [[ -n "$current_service" ]] && [[ -n "$current_dir" ]]; then
+                service_dirs["$current_service"]="$current_dir"
+            fi
+            current_dir="${BASH_REMATCH[1]}"
+            current_service=$(basename "$current_dir")
+            found=1
+        elif [[ "$line" =~ ^HiddenServicePort[[:space:]]+([0-9]+)[[:space:]]+127\.0\.0\.1:([0-9]+)$ ]] && [[ -n "$current_service" ]]; then
+            local tor_port="${BASH_REMATCH[1]}"
+            local local_port="${BASH_REMATCH[2]}"
+            if [[ -z "${port_mappings["$current_service"]:-}" ]]; then
+                port_mappings["$current_service"]="$tor_port → 127.0.0.1:$local_port"
+            else
+                port_mappings["$current_service"]+=$'\n'"  + $tor_port → 127.0.0.1:$local_port"
             fi
         fi
     done < <(sed -n "/$CONFIG_BEGIN_MARKER/,/$CONFIG_END_MARKER/p" "$TORRC_PATH")
+    
+    if [[ -n "$current_service" ]] && [[ -n "$current_dir" ]]; then
+        service_dirs["$current_service"]="$current_dir"
+    fi
+    
+    for svc in "${!service_dirs[@]}"; do
+        local service_dir="${service_dirs[$svc]}"
+        local hostname_file="$service_dir/hostname"
+        local hostname="Not yet generated"
+        
+        if [[ -f "$hostname_file" ]]; then
+            hostname=$(cat "$hostname_file")
+        fi
+        
+        gum style --foreground 212 "● $svc"
+        gum style --foreground 246 "  Directory: $service_dir"
+        gum style --foreground 82 "  Hostname: $hostname"
+        
+        local ports="${port_mappings[$svc]:-No ports configured}"
+        gum style --foreground 213 "  Ports: $ports"
+        echo ""
+        found=1
+    done
     
     if [[ $found -eq 0 ]]; then
         gum style --foreground 226 "No onion services configured."
@@ -872,39 +903,55 @@ create_onion_service() {
     # Sanitize service name
     service_name=$(echo "$service_name" | tr -cd '[:alnum:]-_')
     
-    # Get local port
-    local local_port
-    local_port=$(gum input --placeholder "80" --prompt "Local Port (service running on) > ")
+    declare -a tor_ports=()
+    declare -a local_ports=()
     
-    if [[ ! "$local_port" =~ ^[0-9]+$ ]]; then
-        gum style --foreground 196 "Invalid port number."
-        sleep 1
-        return
-    fi
-    
-    if ! validate_port "$local_port" "Local Port"; then
-        sleep 1
-        return
-    fi
-    
-    if ! is_port_listening "$local_port"; then
-        gum style --foreground 226 "⚠ Warning: Nothing appears to be listening on port $local_port."
-        if ! gum confirm "Continue anyway?"; then
+    while true; do
+        local lport
+        lport=$(gum input --placeholder "80" --prompt "Local Port (service running on) > ")
+        
+        if [[ ! "$lport" =~ ^[0-9]+$ ]]; then
+            gum style --foreground 196 "Invalid port number."
+            sleep 1
             return
         fi
-    fi
+        
+        if ! validate_port "$lport" "Local Port"; then
+            sleep 1
+            return
+        fi
+        
+        if ! is_port_listening "$lport"; then
+            gum style --foreground 226 "⚠ Warning: Nothing appears to be listening on port $lport."
+            if ! gum confirm "Continue anyway?"; then
+                return
+            fi
+        fi
+        
+        local tport
+        tport=$(gum input --placeholder "80" --prompt "Tor Port (external) > ")
+        
+        if [[ ! "$tport" =~ ^[0-9]+$ ]]; then
+            gum style --foreground 196 "Invalid port number."
+            sleep 1
+            return
+        fi
+        
+        if ! validate_port "$tport" "Tor Port"; then
+            sleep 1
+            return
+        fi
+        
+        tor_ports+=("$tport")
+        local_ports+=("$lport")
+        
+        if ! gum confirm "Add another port mapping?"; then
+            break
+        fi
+    done
     
-    # Get Tor port
-    local tor_port
-    tor_port=$(gum input --placeholder "80" --prompt "Tor Port (external) > ")
-    
-    if [[ ! "$tor_port" =~ ^[0-9]+$ ]]; then
-        gum style --foreground 196 "Invalid port number."
-        sleep 1
-        return
-    fi
-    
-    if ! validate_port "$tor_port" "Tor Port"; then
+    if [[ ${#tor_ports[@]} -eq 0 ]]; then
+        gum style --foreground 196 "At least one port mapping is required."
         sleep 1
         return
     fi
@@ -934,18 +981,22 @@ create_onion_service() {
     tmp_file=$(mktemp)
     trap 'rm -f "$tmp_file"' EXIT
     
-    awk -v end="$CONFIG_END_MARKER" \
-        -v service_dir="$service_dir" \
-        -v tor_port="$tor_port" \
-        -v local_port="$local_port" '
+    {
+        awk -v end="$CONFIG_END_MARKER" \
+            -v service_dir="$service_dir" '
         $0 ~ end {
             print "HiddenServiceDir " service_dir
-            print "HiddenServicePort " tor_port " 127.0.0.1:" local_port
             print $0
             next
         }
         { print }
-    ' "$TORRC_PATH" > "$tmp_file"
+        ' "$TORRC_PATH"
+    } > "$tmp_file"
+    
+    local ports_line=""
+    for i in "${!tor_ports[@]}"; do
+        echo "HiddenServicePort ${tor_ports[$i]} 127.0.0.1:${local_ports[$i]}" >> "$tmp_file"
+    done
     
     mv "$tmp_file" "$TORRC_PATH"
     restore_permissions "$original_perms"
@@ -977,8 +1028,12 @@ create_onion_service() {
             "✓ Onion Service Created Successfully!" \
             "" \
             "Service Name: $service_name" \
-            "Onion Address: $hostname" \
-            "Port Mapping: $tor_port → 127.0.0.1:$local_port"
+            "Onion Address: $hostname"
+        
+        gum style --foreground 212 "Port Mappings:"
+        for i in "${!tor_ports[@]}"; do
+            gum style --foreground 213 "  ${tor_ports[$i]} → 127.0.0.1:${local_ports[$i]}"
+        done
         
         # Generate QR code if qrencode is available
         if command -v qrencode &> /dev/null; then
@@ -1087,6 +1142,127 @@ delete_onion_service() {
         
         gum style --foreground 82 "✓ Service '$choice' deleted."
         gum spin --spinner dot --title "Reloading Tor..." -- systemctl reload tor
+        sleep 1
+    fi
+}
+
+add_onion_service_port() {
+    # List available services
+    local services=()
+    
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^HiddenServiceDir[[:space:]]+(.+)$ ]]; then
+            local service_dir="${BASH_REMATCH[1]}"
+            local service_name
+            service_name=$(basename "$service_dir")
+            services+=("$service_name|$service_dir")
+        fi
+    done < <(sed -n "/$CONFIG_BEGIN_MARKER/,/$CONFIG_END_MARKER/p" "$TORRC_PATH")
+    
+    if [[ ${#services[@]} -eq 0 ]]; then
+        gum style --foreground 226 "No onion services found."
+        sleep 1
+        return
+    fi
+    
+    # Format for display
+    local service_choices=()
+    for svc in "${services[@]}"; do
+        local name="${svc%%|*}"
+        service_choices+=("$name")
+    done
+    service_choices+=("← Cancel")
+    
+    local choice
+    choice=$(gum choose "${service_choices[@]}")
+    
+    if [[ "$choice" == "← Cancel" ]]; then
+        return
+    fi
+    
+    # Find the directory for this service
+    local service_dir=""
+    for svc in "${services[@]}"; do
+        local name="${svc%%|*}"
+        if [[ "$name" == "$choice" ]]; then
+            service_dir="${svc##*|}"
+            break
+        fi
+    done
+    
+    gum style --border rounded --padding "1 2" --border-foreground 212 \
+        "Add Port to: $choice"
+    
+    # Get local port
+    local local_port
+    local_port=$(gum input --placeholder "80" --prompt "Local Port (service running on) > ")
+    
+    if [[ ! "$local_port" =~ ^[0-9]+$ ]]; then
+        gum style --foreground 196 "Invalid port number."
+        sleep 1
+        return
+    fi
+    
+    if ! validate_port "$local_port" "Local Port"; then
+        sleep 1
+        return
+    fi
+    
+    if ! is_port_listening "$local_port"; then
+        gum style --foreground 226 "⚠ Warning: Nothing appears to be listening on port $local_port."
+        if ! gum confirm "Continue anyway?"; then
+            return
+        fi
+    fi
+    
+    # Get Tor port
+    local tor_port
+    tor_port=$(gum input --placeholder "80" --prompt "Tor Port (external) > ")
+    
+    if [[ ! "$tor_port" =~ ^[0-9]+$ ]]; then
+        gum style --foreground 196 "Invalid port number."
+        sleep 1
+        return
+    fi
+    
+    if ! validate_port "$tor_port" "Tor Port"; then
+        sleep 1
+        return
+    fi
+    
+    # Add the new HiddenServicePort line after the service's HiddenServiceDir
+    backup_torrc
+    local original_perms
+    original_perms=$(get_file_permissions)
+    
+    local tmp_file
+    tmp_file=$(mktemp)
+    trap 'rm -f "$tmp_file"' EXIT
+    
+    awk -v service_dir="$service_dir" \
+        -v tor_port="$tor_port" \
+        -v local_port="$local_port" '
+    /^HiddenServiceDir / && $2 == service_dir {
+        print $0
+        print "HiddenServicePort " tor_port " 127.0.0.1:" local_port
+        next
+    }
+    { print }
+    ' "$TORRC_PATH" > "$tmp_file"
+    
+    mv "$tmp_file" "$TORRC_PATH"
+    restore_permissions "$original_perms"
+    trap - EXIT
+    
+    if ! validate_tor_config; then
+        return
+    fi
+    
+    gum style --foreground 82 "✓ Port mapping added: $tor_port → 127.0.0.1:$local_port"
+    
+    if gum confirm "Reload Tor to apply changes?"; then
+        gum spin --spinner dot --title "Reloading Tor..." -- systemctl reload tor
+        gum style --foreground 82 "✓ Tor reloaded."
         sleep 1
     fi
 }

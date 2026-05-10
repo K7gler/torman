@@ -12,10 +12,10 @@
 
 set -euo pipefail
 
-# Configuration
-readonly SCRIPT_VERSION="1.0.0"
-readonly TORRC_PATH="/etc/tor/torrc"
-readonly TOR_DATA_DIR="/var/lib/tor"
+# Configuration (overridable via environment variables)
+TORRC_PATH="${TORRC_PATH:-/etc/tor/torrc}"
+TOR_DATA_DIR="${TOR_DATA_DIR:-/var/lib/tor}"
+readonly TORRC_PATH TOR_DATA_DIR
 readonly CONTROL_PORT=9051
 readonly SOCKS_PORT=9050
 readonly CONFIG_BEGIN_MARKER="# BEGIN TORMAN_CONFIG"
@@ -27,6 +27,29 @@ readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
 readonly BLUE='\033[0;34m'
 readonly NC='\033[0m' # No Color
+
+################################################################################
+# Tor User Detection
+################################################################################
+
+get_tor_user() {
+    local tor_user=""
+    local tor_pid
+    tor_pid=$(pgrep -x tor 2>/dev/null | head -n1)
+    if [[ -n "$tor_pid" ]]; then
+        tor_user=$(ps -o user= -p "$tor_pid" 2>/dev/null | tr -d ' ')
+    fi
+    if [[ -z "$tor_user" ]]; then
+        if id debian-tor &>/dev/null; then
+            tor_user="debian-tor"
+        else
+            tor_user="tor"
+        fi
+    fi
+    echo "$tor_user"
+}
+
+readonly TOR_USER=$(get_tor_user)
 
 ################################################################################
 # Dependency Management
@@ -172,11 +195,15 @@ set_config_value() {
     local key="$1"
     local value="$2"
     
+    backup_torrc
+    local original_perms
+    original_perms=$(get_file_permissions)
+    
     ensure_config_block
     
-    # Create a temporary file
     local tmp_file
     tmp_file=$(mktemp)
+    trap 'rm -f "$tmp_file"' EXIT
     
     # Process the file:
     # 1. Copy everything before our block
@@ -222,14 +249,163 @@ set_config_value() {
         !in_block { print }
     ' "$TORRC_PATH" > "$tmp_file"
     
-    # Replace original file
     mv "$tmp_file" "$TORRC_PATH"
-    chmod 644 "$TORRC_PATH"
+    restore_permissions "$original_perms"
+    trap - EXIT
+    
+    if ! validate_tor_config; then
+        return
+    fi
 }
 
 remove_config_value() {
     local key="$1"
     set_config_value "$key" ""
+}
+
+################################################################################
+# Backup and Permissions Management
+################################################################################
+
+backup_torrc() {
+    if [[ ! -f "$TORRC_PATH" ]]; then
+        return
+    fi
+    
+    local backup_dir
+    backup_dir=$(dirname "$TORRC_PATH")
+    local timestamp
+    timestamp=$(date +%Y%m%d-%H%M%S)
+    local backup_file="$TORRC_PATH.backup.$timestamp"
+    
+    cp -p "$TORRC_PATH" "$backup_file"
+    
+    local backup_count
+    backup_count=$(ls -1 "$TORRC_PATH.backup."* 2>/dev/null | wc -l)
+    
+    if [[ $backup_count -gt 5 ]]; then
+        ls -1t "$TORRC_PATH.backup."* | tail -n+$((backup_count - 4)) | xargs -r rm
+    fi
+}
+
+get_file_permissions() {
+    stat -c %a "$TORRC_PATH" 2>/dev/null || stat -f %Lp "$TORRC_PATH" 2>/dev/null
+}
+
+restore_permissions() {
+    local original_perms="$1"
+    if [[ -n "$original_perms" ]]; then
+        chmod "$original_perms" "$TORRC_PATH"
+    fi
+}
+
+################################################################################
+# Tor Config Validation
+################################################################################
+
+validate_tor_config() {
+    local verify_output
+    local verify_exit
+    
+    gum spin --spinner dot --title "Validating Tor configuration..." -- \
+        verify_output=$(tor -f "$TORRC_PATH" --verify-config 2>&1)
+    verify_exit=$?
+    
+    if [[ $verify_exit -ne 0 ]]; then
+        clear
+        gum style --border rounded --padding "1 2" --border-foreground 196 \
+            "✗ Tor Configuration Validation Failed" \
+            "" \
+            "Error output:" \
+            "" \
+            "$(echo "$verify_output" | head -20 | gum format)"
+        
+        local latest_backup
+        latest_backup=$(ls -t "$TORRC_PATH.backup."* 2>/dev/null | head -n1)
+        
+        if [[ -n "$latest_backup" ]] && gum confirm "Restore from latest backup?"; then
+            cp -p "$latest_backup" "$TORRC_PATH"
+            gum style --foreground 82 "✓ Restored from $latest_backup"
+            sleep 2
+            return 1
+        fi
+        
+        gum style --foreground 196 "Configuration NOT applied. Please fix errors manually."
+        sleep 3
+        return 1
+    fi
+    
+    return 0
+}
+
+restore_from_backup() {
+    local latest_backup
+    latest_backup=$(ls -t "$TORRC_PATH.backup."* 2>/dev/null | head -n1)
+    
+    if [[ -n "$latest_backup" ]]; then
+        cp -p "$latest_backup" "$TORRC_PATH"
+        gum style --foreground 82 "✓ Restored from $latest_backup"
+    else
+        gum style --foreground 196 "No backup found."
+    fi
+}
+
+is_port_available() {
+    local port="$1"
+    
+    if command -v ss &> /dev/null; then
+        if ss -tlnp 2>/dev/null | grep -q ":$port "; then
+            return 1
+        fi
+    elif command -v netstat &> /dev/null; then
+        if netstat -tlnp 2>/dev/null | grep -q ":$port "; then
+            return 1
+        fi
+    fi
+    
+    return 0
+}
+
+is_port_listening() {
+    local port="$1"
+    
+    if command -v ss &> /dev/null; then
+        if ss -tlnp 2>/dev/null | grep -q ":$port "; then
+            return 0
+        fi
+    elif command -v netstat &> /dev/null; then
+        if netstat -tlnp 2>/dev/null | grep -q ":$port "; then
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
+validate_port() {
+    local port="$1"
+    local port_name="${2:-Port}"
+    
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [[ $port -lt 1 ]] || [[ $port -gt 65535 ]]; then
+        gum style --foreground 196 "✗ $port_name must be between 1 and 65535."
+        return 1
+    fi
+    
+    if [[ $port -lt 1024 ]]; then
+        gum style --foreground 226 "⚠ Warning: $port_name $port is a privileged port (< 1024). Root binding required."
+        if ! gum confirm "Continue anyway?"; then
+            return 1
+        fi
+    fi
+    
+    if is_port_available "$port"; then
+        gum style --foreground 226 "⚠ Warning: Port $port may already be in use."
+        if ! gum confirm "Continue anyway?"; then
+            return 1
+        fi
+    fi
+    
+    return 0
 }
 
 ################################################################################
@@ -246,8 +422,8 @@ get_tor_status() {
 
 get_tor_external_ip() {
     local ip
-    ip=$(timeout 5 curl -s --socks5 127.0.0.1:"$SOCKS_PORT" https://check.torproject.org/api/ip 2>/dev/null | grep -oP '"IsTor":\s*true.*?"IP":\s*"\K[^"]+' || echo "N/A")
-    echo "$ip"
+    ip=$(timeout 5 curl -s --socks5 127.0.0.1:"$SOCKS_PORT" https://check.torproject.org/api/ip 2>/dev/null | awk -F'"IP": *"' '{if($2)print substr($2,2,index($2,"\"}")-1)}')
+    echo "${ip:-N/A}"
 }
 
 service_control_menu() {
@@ -333,10 +509,12 @@ config_editor_menu() {
         local current_socks
         local current_control
         local current_exit
+        local current_strict
         
         current_socks=$(get_config_value "SocksPort" "$SOCKS_PORT")
         current_control=$(get_config_value "ControlPort" "disabled")
         current_exit=$(get_config_value "ExitNodes" "any")
+        current_strict=$(get_config_value "StrictNodes" "0")
         
         gum style --border rounded --padding "1 2" --border-foreground 212 \
             "Configuration Editor" \
@@ -344,12 +522,14 @@ config_editor_menu() {
             "Current Settings:" \
             "  SOCKS Port: $current_socks" \
             "  Control Port: $current_control" \
-            "  Exit Nodes: $current_exit"
+            "  Exit Nodes: $current_exit" \
+            "  StrictNodes: $current_strict"
         
         local choice
         choice=$(gum choose \
             "Edit SOCKS Port" \
             "Toggle Control Port" \
+            "Toggle StrictNodes" \
             "Set Exit Nodes" \
             "View Full Config" \
             "← Back to Main Menu")
@@ -360,6 +540,9 @@ config_editor_menu() {
                 ;;
             "Toggle Control Port")
                 toggle_control_port
+                ;;
+            "Toggle StrictNodes")
+                toggle_strict_nodes
                 ;;
             "Set Exit Nodes")
                 edit_exit_nodes
@@ -374,6 +557,32 @@ config_editor_menu() {
     done
 }
 
+toggle_strict_nodes() {
+    gum style --foreground 226 \
+        "⚠ StrictNodes Warning" \
+        "" \
+        "StrictNodes forces Tor to ONLY use your specified ExitNodes." \
+        "If none are available, Tor will fail to connect."
+    
+    local current
+    current=$(get_config_value "StrictNodes" "0")
+    
+    if [[ "$current" == "1" ]]; then
+        if gum confirm "StrictNodes is ENABLED. Disable it?"; then
+            set_config_value "StrictNodes" "0"
+            gum style --foreground 82 "✓ StrictNodes disabled."
+            sleep 1
+        fi
+    else
+        if gum confirm "Enable StrictNodes?"; then
+            set_config_value "StrictNodes" "1"
+            gum style --foreground 82 "✓ StrictNodes enabled."
+            gum style --foreground 226 "⚠ Restart Tor for changes to take effect."
+            sleep 2
+        fi
+    fi
+}
+
 edit_socks_port() {
     local current
     current=$(get_config_value "SocksPort" "$SOCKS_PORT")
@@ -381,14 +590,16 @@ edit_socks_port() {
     local new_port
     new_port=$(gum input --placeholder "$current" --prompt "SOCKS Port > " --value "$current")
     
-    if [[ -n "$new_port" ]] && [[ "$new_port" =~ ^[0-9]+$ ]]; then
+    if [[ -n "$new_port" ]]; then
+        if ! validate_port "$new_port" "SOCKS Port"; then
+            sleep 1
+            return
+        fi
+        
         set_config_value "SocksPort" "$new_port"
         gum style --foreground 82 "✓ SOCKS Port set to $new_port"
         gum style --foreground 226 "⚠ Restart Tor for changes to take effect."
         sleep 2
-    else
-        gum style --foreground 196 "Invalid port number."
-        sleep 1
     fi
 }
 
@@ -436,6 +647,20 @@ edit_exit_nodes() {
     new_exit=$(gum input --placeholder "{us},{de},{gb}" --prompt "Exit Nodes > " --value "$current")
     
     if [[ -n "$new_exit" ]]; then
+        local invalid=0
+        local codes=$(echo "$new_exit" | grep -oE '\{[a-zA-Z]{2}\}' | tr -d '{}')
+        local code_count=$(echo "$codes" | grep -c '[a-zA-Z][a-zA-Z]' || true)
+        local expected_count=$(echo "$new_exit" | grep -c '{' || true)
+        
+        if [[ $code_count -ne $expected_count ]]; then
+            gum style --foreground 196 "✗ Invalid country code format!" \
+                "" \
+                "Each country code must be 2 letters inside braces: {us}, {de}, {gb}" \
+                "Example: {us},{de},{gb}"
+            sleep 3
+            return
+        fi
+        
         set_config_value "ExitNodes" "$new_exit"
         gum style --foreground 82 "✓ Exit Nodes set to $new_exit"
     else
@@ -553,12 +778,29 @@ create_onion_service() {
         return
     fi
     
+    if ! validate_port "$local_port" "Local Port"; then
+        sleep 1
+        return
+    fi
+    
+    if ! is_port_listening "$local_port"; then
+        gum style --foreground 226 "⚠ Warning: Nothing appears to be listening on port $local_port."
+        if ! gum confirm "Continue anyway?"; then
+            return
+        fi
+    fi
+    
     # Get Tor port
     local tor_port
     tor_port=$(gum input --placeholder "80" --prompt "Tor Port (external) > ")
     
     if [[ ! "$tor_port" =~ ^[0-9]+$ ]]; then
         gum style --foreground 196 "Invalid port number."
+        sleep 1
+        return
+    fi
+    
+    if ! validate_port "$tor_port" "Tor Port"; then
         sleep 1
         return
     fi
@@ -575,14 +817,18 @@ create_onion_service() {
     gum spin --spinner dot --title "Creating onion service..." -- bash -c "
         # Create directory
         mkdir -p '$service_dir'
-        chown debian-tor:debian-tor '$service_dir'
+        chown "$TOR_USER:$TOR_USER" '$service_dir'
         chmod 700 '$service_dir'
     "
     
     # Add to torrc - we need to add it to our managed block
-    # This requires careful insertion
+    backup_torrc
+    local original_perms
+    original_perms=$(get_file_permissions)
+    
     local tmp_file
     tmp_file=$(mktemp)
+    trap 'rm -f "$tmp_file"' EXIT
     
     awk -v end="$CONFIG_END_MARKER" \
         -v service_dir="$service_dir" \
@@ -598,7 +844,12 @@ create_onion_service() {
     ' "$TORRC_PATH" > "$tmp_file"
     
     mv "$tmp_file" "$TORRC_PATH"
-    chmod 644 "$TORRC_PATH"
+    restore_permissions "$original_perms"
+    trap - EXIT
+    
+    if ! validate_tor_config; then
+        return
+    fi
     
     gum style --foreground 82 "✓ Service configuration added."
     
@@ -693,26 +944,39 @@ delete_onion_service() {
     
     if gum confirm --affirmative="DELETE" --negative="Cancel" "Permanently delete '$choice'?"; then
         # Remove from torrc
+        backup_torrc
+        local original_perms
+        original_perms=$(get_file_permissions)
+        
         local tmp_file
         tmp_file=$(mktemp)
+        trap 'rm -f "$tmp_file"' EXIT
         
         awk -v service_dir="$service_dir" '
-            # Skip HiddenServiceDir line and the following HiddenServicePort line(s)
-            $0 ~ "^HiddenServiceDir " service_dir {
-                skip_next = 1
-                next
-            }
-            skip_next && /^HiddenServicePort/ {
-                next
-            }
-            {
-                skip_next = 0
-                print
-            }
+        /^HiddenServiceDir / && $2 == service_dir {
+            skip_block = 1
+            next
+        }
+        skip_block && /^HiddenServicePort / {
+            next
+        }
+        skip_block && !/^HiddenServicePort / {
+            skip_block = 0
+        }
+        /^HiddenServiceDir / {
+            skip_block = 0
+        }
+        { print }
         ' "$TORRC_PATH" > "$tmp_file"
         
         mv "$tmp_file" "$TORRC_PATH"
-        chmod 644 "$TORRC_PATH"
+        restore_permissions "$original_perms"
+        
+        if ! validate_tor_config; then
+            trap - EXIT
+            return
+        fi
+        trap - EXIT
         
         # Remove directory
         rm -rf "$service_dir"
@@ -756,6 +1020,35 @@ identity_tools_menu() {
     done
 }
 
+authenticate_control_port() {
+    local control_port="$1"
+    local result_file=$(mktemp)
+    local exit_file=$(mktemp)
+    trap 'rm -f "$result_file" "$exit_file"' RETURN EXIT
+    
+    echo -e 'AUTHENTICATE ""\nQUIT' | nc 127.0.0.1 "$control_port" > "$result_file" 2>&1
+    echo $? > "$exit_file"
+    
+    if [[ $(cat "$exit_file") -eq 0 ]] && grep -q "^250 OK" "$result_file"; then
+        return 0
+    fi
+    
+    local cookie_file="/var/lib/tor/control_auth_cookie"
+    if [[ -f "$cookie_file" ]]; then
+        local cookie_hex
+        cookie_hex=$(xxd -p "$cookie_file" | tr -d '\n')
+        if [[ -n "$cookie_hex" ]]; then
+            echo -e "AUTHENTICATE $cookie_hex\nQUIT" | nc 127.0.0.1 "$control_port" > "$result_file" 2>&1
+            echo $? > "$exit_file"
+            if [[ $(cat "$exit_file") -eq 0 ]] && grep -q "^250 OK" "$result_file"; then
+                return 0
+            fi
+        fi
+    fi
+    
+    return 1
+}
+
 new_identity() {
     local control_port
     control_port=$(get_config_value "ControlPort" "")
@@ -769,11 +1062,18 @@ new_identity() {
         return
     fi
     
+    local tmp_result=$(mktemp)
+    local tmp_exit=$(mktemp)
+    trap 'rm -f "$tmp_result" "$tmp_exit"' RETURN EXIT
+    
     gum spin --spinner dot --title "Requesting new identity..." -- bash -c "
-        echo -e 'AUTHENTICATE \"\"\nSIGNAL NEWNYM\nQUIT' | nc 127.0.0.1 $control_port > /dev/null 2>&1
+        echo -e 'AUTHENTICATE \"\"\nSIGNAL NEWNYM\nQUIT' | nc 127.0.0.1 $control_port > '$tmp_result' 2>&1
+        echo \$? > '$tmp_exit'
     "
     
-    if [[ $? -eq 0 ]]; then
+    local nc_exit=$(cat "$tmp_exit")
+    
+    if [[ $nc_exit -eq 0 ]]; then
         gum style --foreground 82 "✓ New identity requested successfully!"
         gum style --foreground 226 "Note: Tor will use a new circuit. Wait a few seconds."
     else
@@ -795,9 +1095,12 @@ check_ip() {
     
     if [[ -n "$ip" ]]; then
         local is_tor
-        is_tor=$(echo "$ip" | grep -o '"IsTor":\s*true' || echo "false")
+        is_tor=$(echo "$ip" | awk '/"IsTor":\s*true/{print "true"}')
         local ip_addr
-        ip_addr=$(echo "$ip" | grep -oP '"IP":\s*"\K[^"]+' || echo "Unknown")
+        ip_addr=$(echo "$ip" | awk -F'"IP": *"' '{if($2)print substr($2,2,index($2,"\"}")-1)}')
+        if [[ -z "$ip_addr" ]]; then
+            ip_addr="Unknown"
+        fi
         
         clear
         if [[ "$is_tor" != "false" ]]; then
@@ -850,7 +1153,16 @@ view_logs() {
     gum style --border double --padding "1 2" --border-foreground 212 "Tor Service Logs (last 50 lines)"
     echo ""
     
-    journalctl -u tor -n 50 --no-pager | gum format
+    if command -v journalctl &> /dev/null && command -v systemctl &> /dev/null && systemctl is-system-running &> /dev/null; then
+        journalctl -u tor -n 50 --no-pager | gum format
+    elif [[ -f /var/log/tor/log ]]; then
+        tail -n 50 /var/log/tor/log | gum format
+    else
+        gum style --foreground 226 "⚠ Could not find Tor logs." \
+            "" \
+            "Neither journalctl nor /var/log/tor/log are available."
+        echo ""
+    fi
     
     echo ""
     gum style --foreground 246 "Press any key to continue..."

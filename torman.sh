@@ -1536,6 +1536,7 @@ identity_tools_menu() {
             "Get New Identity (NEWNYM)" \
             "Check Current IP" \
             "Check Tor Connectivity" \
+            "Show Circuit Info" \
             "← Back to Main Menu")
         
         case "$choice" in
@@ -1547,6 +1548,9 @@ identity_tools_menu() {
                 ;;
             "Check Tor Connectivity")
                 check_tor_connectivity
+                ;;
+            "Show Circuit Info")
+                show_circuit_info
                 ;;
             "← Back to Main Menu")
                 return
@@ -1677,6 +1681,143 @@ check_tor_connectivity() {
     fi
     
     sleep 2
+}
+
+show_circuit_info() {
+    local control_port
+    control_port=$(get_config_value "ControlPort" "")
+
+    if [[ -z "$control_port" ]] || [[ "$control_port" == "disabled" ]]; then
+        gum style --foreground 196 \
+            "✗ Control Port is disabled!" \
+            "" \
+            "Enable it in Configuration Editor first."
+        sleep 2
+        return 1
+    fi
+
+    if ! authenticate_control_port "$control_port"; then
+        gum style --foreground 196 \
+            "✗ Failed to authenticate with Tor control port!" \
+            "" \
+            "Check that ControlPort is enabled and your user has permission."
+        sleep 2
+        return 1
+    fi
+
+    local tmp_result=$(mktemp)
+    local tmp_exit=$(mktemp)
+    trap 'rm -f "$tmp_result" "$tmp_exit"' RETURN EXIT
+
+    gum spin --spinner dot --title "Fetching circuit information..." -- bash -c "
+        echo -e 'AUTHENTICATE \"\"\nGETINFO circuit-status\nQUIT' | nc 127.0.0.1 $control_port > '$tmp_result' 2>&1
+        echo \$? > '$tmp_exit'
+    "
+
+    if [[ $(cat "$tmp_exit") -ne 0 ]]; then
+        gum style --foreground 196 "✗ Failed to query Tor control port."
+        sleep 2
+        return 1
+    fi
+
+    local raw_output=$(cat "$tmp_result")
+    local circuits_data=$(echo "$raw_output" | grep -A 100 "^250+circuit-status=" | tail -n +2 | grep -v "^250" | grep -v "^---" | head -n -1)
+
+    if [[ -z "$circuits_data" ]]; then
+        clear
+        gum style --border rounded --padding "1 2" --border-foreground 226 \
+            "No Active Circuits" \
+            "" \
+            "No active Tor circuits found." \
+            "Try requesting a new identity to establish a circuit."
+        echo ""
+        gum style --foreground 246 "Press any key to continue..."
+        read -n 1 -s
+        return 0
+    fi
+
+    clear
+    local circuit_num=0
+    local output=""
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+
+        circuit_num=$((circuit_num + 1))
+        local circuit_id=$(echo "$line" | awk '{print $1}')
+        local circuit_status=$(echo "$line" | awk '{print $2}')
+        local purpose=""
+
+        local purpose_match=$(echo "$line" | grep -oP 'PURPOSE=\K[^ ]+')
+        [[ -n "$purpose_match" ]] && purpose="$purpose_match"
+
+        local path_info=$(echo "$line" | grep -oP '\$[[^ ]+' | head -3)
+
+        local guard_info middle_info exit_info
+        guard_info=$(echo "$path_info" | head -1)
+        middle_info=$(echo "$path_info" | head -2 | tail -1)
+        exit_info=$(echo "$path_info" | tail -1)
+
+        parse_node_info() {
+            local node="$1"
+            local fingerprint nickname
+            fingerprint=$(echo "$node" | cut -d'$' -f2 | cut -d'~' -f1)
+            nickname=$(echo "$node" | cut -d'~' -f2 | cut -d',' -f1)
+            echo "$nickname|$fingerprint"
+        }
+
+        local guard_nick guard_fp middle_nick middle_fp exit_nick exit_fp
+
+        if [[ -n "$guard_info" ]]; then
+            guard_info=$(parse_node_info "$guard_info")
+            guard_nick=$(echo "$guard_info" | cut -d'|' -f1)
+            guard_fp=$(echo "$guard_info" | cut -d'|' -f2)
+        else
+            guard_nick="Unknown"
+            guard_fp="Unknown"
+        fi
+
+        if [[ -n "$middle_info" ]]; then
+            middle_info=$(parse_node_info "$middle_info")
+            middle_nick=$(echo "$middle_info" | cut -d'|' -f1)
+            middle_fp=$(echo "$middle_info" | cut -d'|' -f2)
+        else
+            middle_nick="Unknown"
+            middle_fp="Unknown"
+        fi
+
+        if [[ -n "$exit_info" ]]; then
+            exit_info=$(parse_node_info "$exit_info")
+            exit_nick=$(echo "$exit_info" | cut -d'|' -f1)
+            exit_fp=$(echo "$exit_info" | cut -d'|' -f2)
+        else
+            exit_nick="Unknown"
+            exit_fp="Unknown"
+        fi
+
+        local panel_content="Circuit #$circuit_id ($circuit_status)"
+        panel_content+="\n"
+        panel_content+="├── Guard:   $guard_nick (\$$guard_fp)"
+        panel_content+="\n"
+        panel_content+="├── Middle:  $middle_nick (\$$middle_fp)"
+        panel_content+="\n"
+        panel_content+="└── Exit:    $exit_nick (\$$exit_fp)"
+        panel_content+="\n"
+        panel_content+="Purpose: ${purpose:-GENERAL}"
+
+        if [[ $circuit_num -eq 1 ]]; then
+            output=$(gum style --border rounded --padding "1 2" --border-foreground 212 "$panel_content")
+        else
+            output+=$'\n'
+            output+=$(gum style --border rounded --padding "1 2" --border-foreground 212 "$panel_content")
+        fi
+    done <<< "$circuits_data"
+
+    echo "$output"
+
+    echo ""
+    gum style --foreground 246 "Press any key to continue..."
+    read -n 1 -s
 }
 
 ################################################################################

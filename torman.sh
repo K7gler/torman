@@ -420,6 +420,25 @@ get_tor_status() {
     fi
 }
 
+offer_restart() {
+    local status
+    status=$(get_tor_status)
+    
+    if [[ "$status" == "active" ]]; then
+        if gum confirm "Restart Tor now to apply changes?"; then
+            gum spin --spinner dot --title "Restarting Tor..." -- systemctl restart tor
+            gum style --foreground 82 "✓ Tor restarted successfully!"
+            sleep 1
+        fi
+    else
+        if gum confirm "Start Tor now to apply changes?"; then
+            gum spin --spinner dot --title "Starting Tor..." -- systemctl start tor
+            gum style --foreground 82 "✓ Tor started successfully!"
+            sleep 1
+        fi
+    fi
+}
+
 get_tor_external_ip() {
     local ip
     ip=$(timeout 5 curl -s --socks5 127.0.0.1:"$SOCKS_PORT" https://check.torproject.org/api/ip 2>/dev/null | awk -F'"IP": *"' '{if($2)print substr($2,2,index($2,"\"}")-1)}')
@@ -571,14 +590,13 @@ toggle_strict_nodes() {
         if gum confirm "StrictNodes is ENABLED. Disable it?"; then
             set_config_value "StrictNodes" "0"
             gum style --foreground 82 "✓ StrictNodes disabled."
-            sleep 1
+            offer_restart
         fi
     else
         if gum confirm "Enable StrictNodes?"; then
             set_config_value "StrictNodes" "1"
             gum style --foreground 82 "✓ StrictNodes enabled."
-            gum style --foreground 226 "⚠ Restart Tor for changes to take effect."
-            sleep 2
+            offer_restart
         fi
     fi
 }
@@ -598,8 +616,7 @@ edit_socks_port() {
         
         set_config_value "SocksPort" "$new_port"
         gum style --foreground 82 "✓ SOCKS Port set to $new_port"
-        gum style --foreground 226 "⚠ Restart Tor for changes to take effect."
-        sleep 2
+        offer_restart
     fi
 }
 
@@ -620,15 +637,13 @@ toggle_control_port() {
         if gum confirm "Enable Control Port?"; then
             set_config_value "ControlPort" "$CONTROL_PORT"
             gum style --foreground 82 "✓ Control Port enabled on $CONTROL_PORT"
-            gum style --foreground 226 "⚠ Restart Tor for changes to take effect."
-            sleep 2
+            offer_restart
         fi
     else
         if gum confirm "Disable Control Port? (This will break 'New Identity' feature)"; then
             remove_config_value "ControlPort"
             gum style --foreground 82 "✓ Control Port disabled."
-            gum style --foreground 226 "⚠ Restart Tor for changes to take effect."
-            sleep 2
+            offer_restart
         fi
     fi
 }
@@ -663,13 +678,12 @@ edit_exit_nodes() {
         
         set_config_value "ExitNodes" "$new_exit"
         gum style --foreground 82 "✓ Exit Nodes set to $new_exit"
+        offer_restart
     else
         remove_config_value "ExitNodes"
         gum style --foreground 82 "✓ Exit Nodes cleared (using any)."
+        offer_restart
     fi
-    
-    gum style --foreground 226 "⚠ Restart Tor for changes to take effect."
-    sleep 2
 }
 
 view_config() {

@@ -12,10 +12,10 @@
 
 set -euo pipefail
 
-# Configuration
-readonly SCRIPT_VERSION="1.0.0"
-readonly TORRC_PATH="/etc/tor/torrc"
-readonly TOR_DATA_DIR="/var/lib/tor"
+# Configuration (overridable via environment variables)
+TORRC_PATH="${TORRC_PATH:-/etc/tor/torrc}"
+TOR_DATA_DIR="${TOR_DATA_DIR:-/var/lib/tor}"
+readonly TORRC_PATH TOR_DATA_DIR
 readonly CONTROL_PORT=9051
 readonly SOCKS_PORT=9050
 readonly CONFIG_BEGIN_MARKER="# BEGIN TORMAN_CONFIG"
@@ -27,6 +27,29 @@ readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
 readonly BLUE='\033[0;34m'
 readonly NC='\033[0m' # No Color
+
+################################################################################
+# Tor User Detection
+################################################################################
+
+get_tor_user() {
+    local tor_user=""
+    local tor_pid
+    tor_pid=$(pgrep -x tor 2>/dev/null | head -n1)
+    if [[ -n "$tor_pid" ]]; then
+        tor_user=$(ps -o user= -p "$tor_pid" 2>/dev/null | tr -d ' ')
+    fi
+    if [[ -z "$tor_user" ]]; then
+        if id debian-tor &>/dev/null; then
+            tor_user="debian-tor"
+        else
+            tor_user="tor"
+        fi
+    fi
+    echo "$tor_user"
+}
+
+readonly TOR_USER=$(get_tor_user)
 
 ################################################################################
 # Dependency Management
@@ -575,7 +598,7 @@ create_onion_service() {
     gum spin --spinner dot --title "Creating onion service..." -- bash -c "
         # Create directory
         mkdir -p '$service_dir'
-        chown debian-tor:debian-tor '$service_dir'
+        chown "$TOR_USER:$TOR_USER" '$service_dir'
         chmod 700 '$service_dir'
     "
     

@@ -561,6 +561,8 @@ config_editor_menu() {
             "Set Exclude Nodes" \
             "Set Exclude Exit Nodes" \
             "View Full Config" \
+            "Export Config" \
+            "Import Config" \
             "← Back to Main Menu")
         
         case "$choice" in
@@ -584,6 +586,12 @@ config_editor_menu() {
                 ;;
             "View Full Config")
                 view_config
+                ;;
+            "Export Config")
+                export_config
+                ;;
+            "Import Config")
+                import_config
                 ;;
             "← Back to Main Menu")
                 return
@@ -786,6 +794,147 @@ view_config() {
     echo ""
     gum style --foreground 226 "Press any key to continue..."
     read -n 1 -s
+}
+
+export_config() {
+    local default_path
+    default_path="$HOME/torman-config-export-$(date +%Y%m%d-%H%M%S).txt"
+    
+    local export_path
+    export_path=$(gum input --placeholder "$default_path" --prompt "Export path > " --value "$default_path")
+    
+    if [[ -z "$export_path" ]]; then
+        gum style --foreground 196 "Export path cannot be empty."
+        sleep 1
+        return
+    fi
+    
+    local config_block
+    config_block=$(sed -n "/$CONFIG_BEGIN_MARKER/,/$CONFIG_END_MARKER/p" "$TORRC_PATH")
+    
+    if [[ -z "$config_block" ]]; then
+        gum style --foreground 196 "No configuration block found to export."
+        sleep 1
+        return
+    fi
+    
+    local hostname
+    hostname=$(hostname 2>/dev/null || echo "unknown")
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S %Z')
+    
+    if ! mkdir -p "$(dirname "$export_path")" 2>/dev/null; then
+        gum style --foreground 196 "Failed to create directory for export path."
+        sleep 1
+        return
+    fi
+    
+    if printf '# TorMan Configuration Export\n# Generated: %s\n# Machine: %s\n#\n%s\n' "$timestamp" "$hostname" "$config_block" > "$export_path"; then
+        chmod 600 "$export_path"
+        gum style --foreground 82 "✓ Configuration exported to $export_path"
+    else
+        gum style --foreground 196 "Failed to write export file."
+    fi
+    
+    sleep 1
+}
+
+import_config() {
+    local import_path
+    import_path=$(gum input --placeholder "/path/to/config.txt" --prompt "Import file path > ")
+    
+    if [[ -z "$import_path" ]]; then
+        gum style --foreground 196 "Import path cannot be empty."
+        sleep 1
+        return
+    fi
+    
+    if [[ ! -f "$import_path" ]]; then
+        gum style --foreground 196 "File not found: $import_path"
+        sleep 1
+        return
+    fi
+    
+    if ! grep -q "$CONFIG_BEGIN_MARKER" "$import_path"; then
+        gum style --foreground 196 "File does not contain $CONFIG_BEGIN_MARKER"
+        sleep 1
+        return
+    fi
+    
+    if ! grep -q "$CONFIG_END_MARKER" "$import_path"; then
+        gum style --foreground 196 "File does not contain $CONFIG_END_MARKER"
+        sleep 1
+        return
+    fi
+    
+    local import_block
+    import_block=$(sed -n "/$CONFIG_BEGIN_MARKER/,/$CONFIG_END_MARKER/p" "$import_path")
+    
+    clear
+    gum style --border double --padding "1 2" --border-foreground 212 "Import Preview"
+    echo ""
+    gum style --foreground 212 "Key-value pairs in import file:"
+    echo ""
+    
+    echo "$import_block" | grep -E '^\w+\s+' | gum format
+    echo ""
+    
+    gum style --foreground 196 \
+        "⚠ WARNING: DESTRUCTIVE OPERATION" \
+        "" \
+        "Importing will OVERWRITE your existing managed configuration block." \
+        "If onion services exist in the current config but not in the import," \
+        "they will be LOST from torrc (though directories remain)."
+    
+    if ! gum confirm "Proceed with import?"; then
+        gum style --foreground 226 "Import cancelled."
+        sleep 1
+        return
+    fi
+    
+    backup_torrc
+    local original_perms
+    original_perms=$(get_file_permissions)
+    
+    local tmp_file
+    tmp_file=$(mktemp)
+    trap 'rm -f "$tmp_file"' EXIT
+    
+    awk -v begin="$CONFIG_BEGIN_MARKER" \
+        -v end="$CONFIG_END_MARKER" \
+        -v newblock="$import_block" '
+    BEGIN { in_block=0 }
+    
+    $0 ~ begin {
+        print $0
+        in_block=1
+        next
+    }
+    
+    in_block && $0 !~ end {
+        next
+    }
+    
+    $0 ~ end {
+        printf "%s", newblock
+        print $0
+        in_block=0
+        next
+    }
+    
+    !in_block { print }
+    ' "$TORRC_PATH" > "$tmp_file"
+    
+    mv "$tmp_file" "$TORRC_PATH"
+    restore_permissions "$original_perms"
+    trap - EXIT
+    
+    if ! validate_tor_config; then
+        return
+    fi
+    
+    gum style --foreground 82 "✓ Configuration imported successfully!"
+    offer_restart
 }
 
 ################################################################################

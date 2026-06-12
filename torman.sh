@@ -193,6 +193,21 @@ get_config_value() {
     echo "${value:-$default}"
 }
 
+validate_country_codes() {
+    local input="$1"
+    local codes
+    codes=$(echo "$input" | grep -oE '\{[a-zA-Z]{2}\}' | tr -d '{}')
+    local code_count
+    code_count=$(echo "$codes" | grep -c '[a-zA-Z][a-zA-Z]' || true)
+    local expected_count
+    expected_count=$(echo "$input" | grep -c '{' || true)
+    
+    if [[ $code_count -ne $expected_count ]]; then
+        return 1
+    fi
+    return 0
+}
+
 set_config_value() {
     local key="$1"
     local value="$2"
@@ -686,12 +701,7 @@ edit_exit_nodes() {
     new_exit=$(gum input --placeholder "{us},{de},{gb}" --prompt "Exit Nodes > " --value "$current")
     
     if [[ -n "$new_exit" ]]; then
-        local invalid=0
-        local codes=$(echo "$new_exit" | grep -oE '\{[a-zA-Z]{2}\}' | tr -d '{}')
-        local code_count=$(echo "$codes" | grep -c '[a-zA-Z][a-zA-Z]' || true)
-        local expected_count=$(echo "$new_exit" | grep -c '{' || true)
-        
-        if [[ $code_count -ne $expected_count ]]; then
+        if ! validate_country_codes "$new_exit"; then
             gum style --foreground 196 "✗ Invalid country code format!" \
                 "" \
                 "Each country code must be 2 letters inside braces: {us}, {de}, {gb}" \
@@ -725,11 +735,7 @@ edit_exclude_nodes() {
     new_exclude=$(gum input --placeholder "{ru},{cn}" --prompt "Exclude Nodes > " --value "$current")
     
     if [[ -n "$new_exclude" ]]; then
-        local codes=$(echo "$new_exclude" | grep -oE '\{[a-zA-Z]{2}\}' | tr -d '{}')
-        local code_count=$(echo "$codes" | grep -c '[a-zA-Z][a-zA-Z]' || true)
-        local expected_count=$(echo "$new_exclude" | grep -c '{' || true)
-        
-        if [[ $code_count -ne $expected_count ]]; then
+        if ! validate_country_codes "$new_exclude"; then
             gum style --foreground 196 "✗ Invalid country code format!" \
                 "" \
                 "Each country code must be 2 letters inside braces: {ru}, {cn}, {kp}" \
@@ -763,11 +769,7 @@ edit_exclude_exit_nodes() {
     new_exclude=$(gum input --placeholder "{ru},{cn}" --prompt "Exclude Exit Nodes > " --value "$current")
     
     if [[ -n "$new_exclude" ]]; then
-        local codes=$(echo "$new_exclude" | grep -oE '\{[a-zA-Z]{2}\}' | tr -d '{}')
-        local code_count=$(echo "$codes" | grep -c '[a-zA-Z][a-zA-Z]' || true)
-        local expected_count=$(echo "$new_exclude" | grep -c '{' || true)
-        
-        if [[ $code_count -ne $expected_count ]]; then
+        if ! validate_country_codes "$new_exclude"; then
             gum style --foreground 196 "✗ Invalid country code format!" \
                 "" \
                 "Each country code must be 2 letters inside braces: {ru}, {cn}, {kp}" \

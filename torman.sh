@@ -1720,25 +1720,43 @@ identity_tools_menu() {
 
 authenticate_control_port() {
     local control_port="$1"
+    shift
+    local commands=("$@")
+    
     local result_file=$(mktemp)
-    local exit_file=$(mktemp)
-    trap 'rm -f "$result_file" "$exit_file"' RETURN EXIT
+    trap 'rm -f "$result_file"' RETURN EXIT
     
-    echo -e 'AUTHENTICATE ""\nQUIT' | nc 127.0.0.1 "$control_port" > "$result_file" 2>&1
-    echo $? > "$exit_file"
+    # Try empty auth first
+    local auth_cmd="AUTHENTICATE \"\""
+    for cmd in "${commands[@]}"; do
+        auth_cmd="${auth_cmd}\n${cmd}"
+    done
+    auth_cmd="${auth_cmd}\nQUIT"
     
-    if [[ $(cat "$exit_file") -eq 0 ]] && grep -q "^250 OK" "$result_file"; then
+    echo -e "$auth_cmd" | nc 127.0.0.1 "$control_port" > "$result_file" 2>&1
+    local exit_code=$?
+    
+    if [[ $exit_code -eq 0 ]] && grep -q "^250 OK" "$result_file"; then
+        cat "$result_file"
         return 0
     fi
     
+    # Fallback to cookie auth
     local cookie_file="/var/lib/tor/control_auth_cookie"
     if [[ -f "$cookie_file" ]]; then
         local cookie_hex
         cookie_hex=$(xxd -p "$cookie_file" | tr -d '\n')
         if [[ -n "$cookie_hex" ]]; then
-            echo -e "AUTHENTICATE $cookie_hex\nQUIT" | nc 127.0.0.1 "$control_port" > "$result_file" 2>&1
-            echo $? > "$exit_file"
-            if [[ $(cat "$exit_file") -eq 0 ]] && grep -q "^250 OK" "$result_file"; then
+            local cookie_cmd="AUTHENTICATE $cookie_hex"
+            for cmd in "${commands[@]}"; do
+                cookie_cmd="${cookie_cmd}\n${cmd}"
+            done
+            cookie_cmd="${cookie_cmd}\nQUIT"
+            
+            echo -e "$cookie_cmd" | nc 127.0.0.1 "$control_port" > "$result_file" 2>&1
+            exit_code=$?
+            if [[ $exit_code -eq 0 ]] && grep -q "^250 OK" "$result_file"; then
+                cat "$result_file"
                 return 0
             fi
         fi
@@ -1760,18 +1778,13 @@ new_identity() {
         return
     fi
     
-    local tmp_result=$(mktemp)
-    local tmp_exit=$(mktemp)
-    trap 'rm -f "$tmp_result" "$tmp_exit"' RETURN EXIT
+    local result
+    result=$(gum spin --spinner dot --title "Requesting new identity..." -- bash -c "
+        $(declare -f authenticate_control_port)
+        authenticate_control_port \"$control_port\" 'SIGNAL NEWNYM'
+    ")
     
-    gum spin --spinner dot --title "Requesting new identity..." -- bash -c "
-        echo -e 'AUTHENTICATE \"\"\nSIGNAL NEWNYM\nQUIT' | nc 127.0.0.1 $control_port > '$tmp_result' 2>&1
-        echo \$? > '$tmp_exit'
-    "
-    
-    local nc_exit=$(cat "$tmp_exit")
-    
-    if [[ $nc_exit -eq 0 ]]; then
+    if [[ $? -eq 0 ]]; then
         gum style --foreground 82 "✓ New identity requested successfully!"
         gum style --foreground 226 "Note: Tor will use a new circuit. Wait a few seconds."
     else
@@ -1855,7 +1868,13 @@ show_circuit_info() {
         return 1
     fi
 
-    if ! authenticate_control_port "$control_port"; then
+    local result
+    result=$(gum spin --spinner dot --title "Fetching circuit information..." -- bash -c "
+        $(declare -f authenticate_control_port)
+        authenticate_control_port \"$control_port\" 'GETINFO circuit-status'
+    ")
+
+    if [[ $? -ne 0 ]]; then
         gum style --foreground 196 \
             "✗ Failed to authenticate with Tor control port!" \
             "" \
@@ -1864,22 +1883,7 @@ show_circuit_info() {
         return 1
     fi
 
-    local tmp_result=$(mktemp)
-    local tmp_exit=$(mktemp)
-    trap 'rm -f "$tmp_result" "$tmp_exit"' RETURN EXIT
-
-    gum spin --spinner dot --title "Fetching circuit information..." -- bash -c "
-        echo -e 'AUTHENTICATE \"\"\nGETINFO circuit-status\nQUIT' | nc 127.0.0.1 $control_port > '$tmp_result' 2>&1
-        echo \$? > '$tmp_exit'
-    "
-
-    if [[ $(cat "$tmp_exit") -ne 0 ]]; then
-        gum style --foreground 196 "✗ Failed to query Tor control port."
-        sleep 2
-        return 1
-    fi
-
-    local raw_output=$(cat "$tmp_result")
+    local raw_output="$result"
     local circuits_data=$(echo "$raw_output" | grep -A 100 "^250+circuit-status=" | tail -n +2 | grep -v "^250" | grep -v "^---" | head -n -1)
 
     if [[ -z "$circuits_data" ]]; then
@@ -2031,31 +2035,19 @@ bandwidth_monitor_menu() {
             "Press Enter to exit"
         echo ""
         
-        local tmp_result=$(mktemp)
-        local tmp_exit=$(mktemp)
-        trap 'rm -f "$tmp_result" "$tmp_exit"' RETURN EXIT
+        local result
+        result=$(authenticate_control_port "$control_port" "GETINFO traffic/read" "GETINFO traffic/written")
         
-        {
-            echo -e 'AUTHENTICATE ""\nGETINFO traffic/read\nGETINFO traffic/written\nQUIT'
-        } | nc 127.0.0.1 "$control_port" > "$tmp_result" 2>&1
-        echo $? > "$tmp_exit"
-        
-        if [[ $(cat "$tmp_exit") -ne 0 ]]; then
-            local cookie_file="/var/lib/tor/control_auth_cookie"
-            if [[ -f "$cookie_file" ]]; then
-                local cookie_hex
-                cookie_hex=$(xxd -p "$cookie_file" | tr -d '\n')
-                if [[ -n "$cookie_hex" ]]; then
-                    {
-                        echo -e "AUTHENTICATE $cookie_hex\nGETINFO traffic/read\nGETINFO traffic/written\nQUIT"
-                    } | nc 127.0.0.1 "$control_port" > "$tmp_result" 2>&1
-                    echo $? > "$tmp_exit"
-                fi
-            fi
+        if [[ $? -ne 0 ]]; then
+            gum style --foreground 196 "✗ Failed to get bandwidth stats. Check control port."
+            echo ""
+            gum style --foreground 246 "Press Enter to exit..."
+            read -n 1 -s
+            return
         fi
         
-        local traffic_read=$(grep "^250-traffic/read=" "$tmp_result" | cut -d= -f2)
-        local traffic_written=$(grep "^250-traffic/written=" "$tmp_result" | cut -d= -f2)
+        local traffic_read=$(echo "$result" | grep "^250-traffic/read=" | cut -d= -f2)
+        local traffic_written=$(echo "$result" | grep "^250-traffic/written=" | cut -d= -f2)
         
         if [[ -z "$traffic_read" ]] || [[ -z "$traffic_written" ]]; then
             gum style --foreground 196 "✗ Failed to get bandwidth stats. Check control port."

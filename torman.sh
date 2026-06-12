@@ -2209,6 +2209,30 @@ main_menu() {
 ################################################################################
 
 main() {
+    # CLI argument parsing
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                echo "Usage: $0 [OPTIONS]"
+                echo ""
+                echo "Options:"
+                echo "  -h, --help     Show this help message and exit"
+                echo "  -v, --version  Show version information and exit"
+                exit 0
+                ;;
+            -v|--version)
+                echo "TorMan version $SCRIPT_VERSION"
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1"
+                echo "Use --help for usage information."
+                exit 1
+                ;;
+        esac
+        shift
+    done
+
     # Pre-flight checks
     check_root
     check_gum

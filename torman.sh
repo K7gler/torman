@@ -1714,8 +1714,7 @@ authenticate_control_port() {
     local commands=("$@")
     
     local result_file=$(mktemp)
-    local exit_file=$(mktemp)
-    trap 'rm -f "$result_file" "$exit_file"' RETURN EXIT
+    trap 'rm -f "$result_file"' RETURN EXIT
     
     # Try empty auth first
     local auth_cmd="AUTHENTICATE \"\""
@@ -1770,7 +1769,10 @@ new_identity() {
     fi
     
     local result
-    result=$(authenticate_control_port "$control_port" "SIGNAL NEWNYM")
+    result=$(gum spin --spinner dot --title "Requesting new identity..." -- bash -c "
+        $(declare -f authenticate_control_port)
+        authenticate_control_port \"$control_port\" 'SIGNAL NEWNYM'
+    ")
     
     if [[ $? -eq 0 ]]; then
         gum style --foreground 82 "✓ New identity requested successfully!"
@@ -1857,7 +1859,10 @@ show_circuit_info() {
     fi
 
     local result
-    result=$(authenticate_control_port "$control_port" "GETINFO circuit-status")
+    result=$(gum spin --spinner dot --title "Fetching circuit information..." -- bash -c "
+        $(declare -f authenticate_control_port)
+        authenticate_control_port \"$control_port\" 'GETINFO circuit-status'
+    ")
 
     if [[ $? -ne 0 ]]; then
         gum style --foreground 196 \

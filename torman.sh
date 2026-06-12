@@ -21,6 +21,7 @@ readonly SOCKS_PORT=9050
 readonly CONFIG_BEGIN_MARKER="# BEGIN TORMAN_CONFIG"
 readonly CONFIG_END_MARKER="# END TORMAN_CONFIG"
 readonly BACKUP_DIR="/var/backups/torman"
+readonly SCRIPT_VERSION='1.0.0'
 
 # Colors for fallback mode
 readonly RED='\033[0;31m'
@@ -106,11 +107,15 @@ install_gum() {
 check_dependencies() {
     local missing_deps=()
     
-    for cmd in tor curl nc gzip; do
+    for cmd in tor curl nc gzip bc xxd; do
         if ! command -v "$cmd" &> /dev/null; then
             missing_deps+=("$cmd")
         fi
     done
+    
+    if ! command -v ss &> /dev/null && ! command -v netstat &> /dev/null; then
+        missing_deps+=("ss")
+    fi
     
     if [[ ${#missing_deps[@]} -gt 0 ]]; then
         gum style --border double --padding "1 2" --foreground 226 \
@@ -138,6 +143,9 @@ install_dependencies() {
         [tor]="tor"
         [curl]="curl"
         [gzip]="gzip"
+        [bc]="bc"
+        [xxd]="xxd"
+        [ss]="iproute2"
     )
     
     local packages=()

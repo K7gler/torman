@@ -1808,7 +1808,7 @@ check_ip() {
         local is_tor
         is_tor=$(echo "$ip" | awk '/"IsTor":\s*true/{print "true"}')
         local ip_addr
-        ip_addr=$(echo "$ip" | awk -F'"IP": *"' '{if($2)print substr($2,2,index($2,"\"}")-1)}')
+        ip_addr=$(echo "$ip" | awk -F'"IP": *"' '{if($2) { gsub(/".*/, "", $2); print $2 }}')
         if [[ -z "$ip_addr" ]]; then
             ip_addr="Unknown"
         fi
